@@ -543,7 +543,9 @@ def search_ctwant(page, keyword, start_date, end_date):
 def search_mirrormedia(page, keyword, start_date, end_date):
     """鏡週刊 mirrormedia.mg（與既有的「鏡報」mirrordaily.news 是不同網站）。
     維持 Playwright：搜尋結果由前端 miso 搜尋元件（React）動態載入，純 requests
-    拿到的 HTML 裡 `a.miso-list__item-body` 選擇器抓不到任何項目，需要 JS 執行。"""
+    拿到的 HTML 裡 `a.miso-list__item-body` 選擇器抓不到任何項目，需要 JS 執行。
+    改用共用的 `_filter()`（含暱稱比對），並把整張卡的文字一併當 context 傳入，
+    不再只比對標題本身——原本這裡是各自土砲的嚴格比對，沒套用到暱稱比對修正。"""
     kw = quote(keyword)
     url = f"https://www.mirrormedia.mg/search/{kw}"
     page.goto(url, timeout=20000, wait_until="load")
@@ -551,19 +553,12 @@ def search_mirrormedia(page, keyword, start_date, end_date):
     try:
         items = page.eval_on_selector_all(
             "a.miso-list__item-body",
-            "els => els.map(e => ({href: e.href, title: (e.querySelector('.miso-list__item-title')||{}).textContent || ''}))",
+            "els => els.map(e => ({href: e.href, title: (e.querySelector('.miso-list__item-title')||{}).textContent || '', context: e.textContent.trim()}))",
         )
     except Exception:
         items = []
-    seen, matched = set(), []
-    for it in items:
-        href, title = it["href"], (it["title"] or "").strip()
-        if href in seen or "mirrormedia.mg/story/" not in href:
-            continue
-        if len(title) < 6 or keyword not in title:
-            continue
-        seen.add(href)
-        matched.append({"title": title, "url": href})
+    links = [{"title": (it["title"] or "").strip(), "href": it["href"], "context": it.get("context")} for it in items]
+    matched = _filter(links, keyword, ["mirrormedia.mg/story/"])
     return _attach_dates(matched, start_date, end_date)
 
 
