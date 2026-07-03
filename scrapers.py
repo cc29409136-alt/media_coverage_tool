@@ -276,28 +276,32 @@ def _fetch_article_date(url, timeout=_ARTICLE_DATE_TIMEOUT):
 
 def _attach_dates(matched, start_date, end_date, max_candidates=_ARTICLE_DATE_MAX_CANDIDATES):
     """對 matched（list of {"title","url"}）逐篇（限制筆數、平行處理）抓發布日期，
-    並依 start_date/end_date 過濾。抓不到日期的文章一律捨棄（沒有證據代表它在範圍內）。
-    超過 max_candidates 篇的候選文章，因效能考量不會被檢查，直接捨棄（不主動判定為符合）。
+    並依 start_date/end_date 過濾。跟專案裡其他日期比對邏輯（見 matcher.in_range）
+    採取一致的保守原則：只有「明確抓到日期、且確定不在範圍內」才排除；
+    抓不到日期（頁面結構特殊、逾時等）一律保留、標記 date=None，交給人工判斷，
+    不因為抓不到證據就主動當作不符合——這跟關鍵字比對本身已經抓到候選文章的
+    前提矛盾（沒道理標題明明符合，卻因為抓不到日期就整篇消失不見）。
+    超過 max_candidates 篇的候選文章，因效能考量不逐篇抓日期，同樣保留、標記 date=None。
     """
     to_check = matched[:max_candidates]
+    overflow = matched[max_candidates:]
     results = []
-    if not to_check:
-        return results
-    with ThreadPoolExecutor(max_workers=_ARTICLE_DATE_MAX_WORKERS) as executor:
-        future_to_item = {executor.submit(_fetch_article_date, m["url"]): m for m in to_check}
-        for future in as_completed(future_to_item):
-            m = future_to_item[future]
-            try:
-                d = future.result()
-            except Exception:
-                d = None
-            if d is None:
-                continue
-            if not (start_date <= d <= end_date):
-                continue
-            results.append({"title": m["title"], "url": m["url"], "date": d})
+    if to_check:
+        with ThreadPoolExecutor(max_workers=_ARTICLE_DATE_MAX_WORKERS) as executor:
+            future_to_item = {executor.submit(_fetch_article_date, m["url"]): m for m in to_check}
+            for future in as_completed(future_to_item):
+                m = future_to_item[future]
+                try:
+                    d = future.result()
+                except Exception:
+                    d = None
+                if d is not None and not (start_date <= d <= end_date):
+                    continue
+                results.append({"title": m["title"], "url": m["url"], "date": d})
+    for m in overflow:
+        results.append({"title": m["title"], "url": m["url"], "date": None})
     # 保持原始（關鍵字比對）順序，而不是 as_completed 的完成順序
-    order = {m["url"]: i for i, m in enumerate(to_check)}
+    order = {m["url"]: i for i, m in enumerate(matched)}
     results.sort(key=lambda r: order.get(r["url"], 0))
     return results
 

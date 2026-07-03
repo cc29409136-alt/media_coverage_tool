@@ -98,7 +98,10 @@ with st.container(border=True):
         with col2:
             end_date = st.date_input("結束日期", value=date.today())
         with col3:
-            keyword = st.text_input("關鍵字（藝人／品牌／活動名稱）", placeholder="例如：蕭敬騰")
+            keyword = st.text_input(
+                "關鍵字（藝人／品牌／活動名稱，可用「、」「,」分隔多個別名）",
+                placeholder="例如：宋念宇、小宇",
+            )
 
         press_release = st.text_area(
             "新聞稿全文（選填，先貼上留存，未來版本會用來做更精準的比對）",
@@ -113,6 +116,12 @@ if submitted:
     if start_date > end_date:
         st.error("開始日期不能晚於結束日期")
         st.stop()
+
+    # 支援多個別名（例如藝人本名 + 藝名）：用「、」「,」「，」或空白分隔，
+    # 每個站台會逐一用每個別名搜尋一次再合併去重，只要標題符合其中一個別名就算命中
+    # ——很多新聞標題只會寫藝名（如「小宇」）不會寫本名（如「宋念宇」），
+    # 單一關鍵字比對會漏掉這些真正相關的報導。
+    keywords = [k.strip() for k in re.split(r"[、,，\s]+", keyword) if k.strip()]
 
     progress = st.progress(0, text="準備搜尋...")
     original_results = {}
@@ -132,11 +141,16 @@ if submitted:
         for i, site in enumerate(all_active):
             progress.progress((i) / total, text=f"搜尋中：{site['name']}...")
             func = SEARCH_FUNCS.get(site["key"])
-            try:
-                articles = func(page, keyword, start_date, end_date) if func else []
-            except Exception as e:
-                articles = []
-                st.warning(f"{site['name']} 搜尋失敗：{e}")
+            articles_by_url = {}
+            for kw in keywords:
+                try:
+                    kw_articles = func(page, kw, start_date, end_date) if func else []
+                except Exception as e:
+                    kw_articles = []
+                    st.warning(f"{site['name']}（{kw}）搜尋失敗：{e}")
+                for art in kw_articles:
+                    articles_by_url[art["url"]] = art
+            articles = list(articles_by_url.values())
             if site["category"] == "原生媒體":
                 original_results[site["name"]] = articles
             else:
