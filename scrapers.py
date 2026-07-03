@@ -25,22 +25,22 @@ _EXTRACT_ALL_LINKS = """
 els => els.map(e => {
     const titleEl = e.querySelector('h1, h2, h3, h4, [class*="title" i], [class*="headline" i]');
     const title = (titleEl ? titleEl.textContent : e.textContent).trim();
-    const ownText = e.textContent.trim();
+    const minLen = title.length + 15;
     let context = null;
-    if (ownText.length > 30) {
-        context = ownText;
-    } else {
-        let node = e;
-        for (let i = 0; i < 4; i++) {
-            const parent = node.parentElement;
-            if (!parent) break;
-            const text = parent.textContent.trim();
-            if (text.length >= 20) {
-                if (text.length <= 600) context = text;
-                break;
-            }
-            node = parent;
+    let node = e;
+    for (let i = 0; i < 5; i++) {
+        const parent = node.parentElement;
+        if (!parent) break;
+        const text = parent.textContent.trim();
+        if (text.length >= minLen) {
+            if (text.length <= 600) context = text;
+            break;
         }
+        node = parent;
+    }
+    if (context === null) {
+        const ownText = e.textContent.trim();
+        if (ownText.length >= minLen) context = ownText;
     }
     return {title, href: e.href, context};
 })
@@ -170,34 +170,38 @@ def _extract_link_title(a):
 
 
 _CONTEXT_MAX_LEN = 600
+_CONTEXT_MIN_EXTRA = 15  # context 至少要比純標題多這麼多字，才算真的多了摘要內容
 
 
-def _extract_link_context(a):
-    """取得關鍵字比對用的 context 文字（標題＋摘要）。
-    有些卡片式版型把整張卡（標題＋摘要＋更多按鈕）整包塞進同一個 <a> 標籤
-    （`_extract_link_title` 會從裡面挑出乾淨的標題子元素，但 <a> 自己完整的
-    `get_text()` 仍然包含摘要全文）——這種情況下 <a> 自己的完整文字就是最準確
-    的 context，不需要、也不應該往上找父層容器，因為父層容器常常是「一整頁全部
-    搜尋結果」的共用外層，會把好幾篇文章的文字混在一起，反而抓不到正確範圍
-    （這是實際踩到的 bug：CTWANT 的搜尋結果頁把 20 篇文章全部包在同一層 <div>
-    裡，往上找父層容器只會拿到 20000+ 字的大雜燴，遠超長度上限直接被放棄）。
-    只有當 <a> 自己的文字就只是標題本身、沒有額外摘要內容時，才退而求其次往上
-    找父層容器（適用「標題」與「摘要」是分開的兄弟元素、而非同一個 <a> 的版型，
-    例如 LTN 的 <li> 卡片）；父層容器一樣要做長度上限防呆，避免抓到共用外層。
+def _extract_link_context(a, title):
+    """取得關鍵字比對用的 context 文字（標題＋摘要）。目標是找到「比純標題明顯
+    更長」的一段文字（代表真的包含摘要，不是只有標題本身重複一次），依序試兩種
+    常見版型：
+    1. 往上找父層容器：適用「標題」與「摘要」是分開的兄弟元素（例如 Yahoo 的
+       <h3>標題</h3><p>摘要</p>、LTN 的 <li> 卡片）。容器太小（可能只包到標題
+       自己，例如 Yahoo 的 <h3> 只比標題本身多一點點）就繼續往上；容器太大
+       （可能是「一整頁全部搜尋結果」的共用外層，混進其他文章）就放棄父層路線，
+       改試方案 2——這是實際踩到的 bug：CTWANT 的搜尋結果頁把 20 篇文章全部包
+       在同一層 <div> 裡，往上找父層容器會拿到 20000+ 字的大雜燴。
+    2. <a> 自己的完整文字：適用「整張卡（標題＋摘要＋更多按鈕）」整包塞進同一個
+       <a> 標籤的版型（`_extract_link_title` 會從裡面挑出乾淨的標題子元素，但
+       <a> 自己完整的 `get_text()` 仍包含摘要全文），例如 CTWANT。
+    兩種都找不到「明顯比標題長」的文字，就回傳 None，讓呼叫端退回只比對標題。
     """
-    own_text = a.get_text(strip=True)
-    if len(own_text) > 30:
-        return own_text
+    min_len = len(title) + _CONTEXT_MIN_EXTRA
     node = a
-    for _ in range(4):
+    for _ in range(5):
         parent = node.parent
         if parent is None or getattr(parent, "name", None) in (None, "[document]", "html", "body"):
             break
         text = parent.get_text(" ", strip=True)
-        if len(text) >= 20:
-            return text if len(text) <= _CONTEXT_MAX_LEN else None
+        if len(text) >= min_len:
+            if len(text) <= _CONTEXT_MAX_LEN:
+                return text
+            break  # 容器已經太大，往上只會更大，放棄父層路線改試 <a> 自己的文字
         node = parent
-    return None
+    own_text = a.get_text(strip=True)
+    return own_text if len(own_text) >= min_len else None
 
 
 def _all_links_requests(soup, base_url):
@@ -208,7 +212,7 @@ def _all_links_requests(soup, base_url):
     for a in soup.find_all("a", href=True):
         href = urljoin(base_url, a["href"])
         title = _extract_link_title(a)
-        context = _extract_link_context(a)
+        context = _extract_link_context(a, title)
         links.append({"title": title, "href": href, "context": context})
     return links
 
