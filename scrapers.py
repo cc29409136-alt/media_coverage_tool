@@ -11,7 +11,6 @@ import requests
 from bs4 import BeautifulSoup
 
 from config import USER_AGENT
-from matcher import parse_relative_or_absolute, parse_date_from_url
 
 TODAY = date.today()
 
@@ -98,29 +97,11 @@ def _has_nickname_intro(text, keyword):
     return text[idx - 1] not in "，,、 \n\t"
 
 
-def _filter(links, keyword, url_must_contain, min_len=6):
-    """keyword 可以是單一字串，也可以是多個別名組成的 list（由 app.py 拆解使用者
-    輸入的「宋念宇、小宇」這類多別名字串而來）；符合任一別名即算命中。
-    命中條件：關鍵字出現在標題裡，或標題用了暱稱、但摘要裡有「『暱稱』關鍵字」
-    這種新聞慣用介紹句型（見 `_has_nickname_intro`）。不接受「關鍵字只是出現在
-    摘要某處」這種寬鬆比對，避免把單純提及的雜訊文章也算進來。
-    """
-    keywords = [keyword] if isinstance(keyword, str) else keyword
-    seen, results = set(), []
-    for it in links:
-        href, title = it["href"], it["title"]
-        if href in seen:
-            continue
-        if not any(s in href for s in url_must_contain):
-            continue
-        if len(title) < min_len:
-            continue
-        context = it.get("context") or ""
-        if not any(k in title or _has_nickname_intro(context, k) for k in keywords):
-            continue
-        seen.add(href)
-        results.append({"title": _clean_title(title), "url": href})
-    return results
+# 舊版的「只看列表頁摘要」關鍵字比對函式 `_filter()` 已被下方的
+# `_candidate_filter()` ＋ `_verify_candidates()`（造訪文章本頁驗證，見該函式群組上方
+# 說明）取代，所有 search_ 函式皆已改用新流程。新流程在「內容驗證失敗時」的優雅降級
+# 路徑仍然沿用跟 `_filter()` 完全一樣的判斷邏輯（標題命中 or `_has_nickname_intro`
+# 鄰接比對），只是直接寫在 `_verify_candidates()` 內部，不再是獨立函式。
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +111,7 @@ def _filter(links, keyword, url_must_contain, min_len=6):
 # headless Chromium，只用一次 HTTP GET 抓 HTML 再用 BeautifulSoup 解析連結，
 # 大幅降低記憶體與 CPU 用量，適合在 Streamlit Community Cloud 這類資源受限的
 # 免費主機上執行。回傳的資料結構刻意與 `_all_links()`／Playwright 版本一致
-# （list of {"title", "href"} dict），讓 `_filter()` 可以直接共用。
+# （list of {"title", "href", "context"} dict），讓 `_candidate_filter()` 可以直接共用。
 # ---------------------------------------------------------------------------
 
 def _get_soup(url, timeout=20, extra_headers=None):
@@ -230,9 +211,7 @@ def _all_links_requests(soup, base_url):
 # 這個日期做 start_date <= d <= end_date 過濾。
 # ---------------------------------------------------------------------------
 
-_ARTICLE_DATE_MAX_CANDIDATES = 15  # 每個站台最多抓幾篇候選文章的日期（效能考量）
-_ARTICLE_DATE_TIMEOUT = 8  # 單篇文章頁請求逾時秒數
-_ARTICLE_DATE_MAX_WORKERS = 5  # 平行抓取的執行緒數
+_ARTICLE_DATE_TIMEOUT = 8  # 單篇文章頁請求逾時秒數（`_verify_candidates()` 內容驗證也沿用這個逾時值）
 
 _ISO_DATE_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
 _SLASH_DATE_RE = re.compile(r'(\d{4})/(\d{2})/(\d{2})')
@@ -294,20 +273,10 @@ def _extract_date_from_jsonld(soup):
     return None
 
 
-def _fetch_article_date(url, timeout=_ARTICLE_DATE_TIMEOUT):
-    """對單篇文章 URL 發一次 GET，嘗試多種方式擷取發布日期，失敗回傳 None。"""
-    try:
-        resp = requests.get(url, headers=_REQUEST_HEADERS, timeout=timeout)
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
-    if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
-        resp.encoding = resp.apparent_encoding
-    try:
-        soup = BeautifulSoup(resp.text, "lxml")
-    except Exception:
-        return None
-
+def _extract_date_from_soup(soup, raw_text):
+    """從已解析的文章頁 soup（以及原始 HTML 文字，給 regex 保底用）擷取發布日期，
+    嘗試多種方式，失敗回傳 None。給 `_fetch_article_content_and_date()`（日期＋內容
+    一次抓）呼叫，抽成獨立函式方便未來如果需要單獨只抓日期時重用，不用複製一份。"""
     # 1. <meta property="article:published_time" content="...">
     meta = soup.find("meta", attrs={"property": "article:published_time"})
     if meta and meta.get("content"):
@@ -345,7 +314,7 @@ def _fetch_article_date(url, timeout=_ARTICLE_DATE_TIMEOUT):
             return d
 
     # 5. 最後手段：在頁面前段文字中用 regex 找 YYYY-MM-DD / YYYY/MM/DD
-    text_sample = resp.text[:5000]
+    text_sample = raw_text[:5000]
     d = _parse_date_string(text_sample)
     if d:
         return d
@@ -353,34 +322,215 @@ def _fetch_article_date(url, timeout=_ARTICLE_DATE_TIMEOUT):
     return None
 
 
-def _attach_dates(matched, start_date, end_date, max_candidates=_ARTICLE_DATE_MAX_CANDIDATES):
-    """對 matched（list of {"title","url"}）逐篇（限制筆數、平行處理）抓發布日期，
-    並依 start_date/end_date 過濾。跟專案裡其他日期比對邏輯（見 matcher.in_range）
-    採取一致的保守原則：只有「明確抓到日期、且確定不在範圍內」才排除；
-    抓不到日期（頁面結構特殊、逾時等）一律保留、標記 date=None，交給人工判斷，
-    不因為抓不到證據就主動當作不符合——這跟關鍵字比對本身已經抓到候選文章的
-    前提矛盾（沒道理標題明明符合，卻因為抓不到日期就整篇消失不見）。
-    超過 max_candidates 篇的候選文章，因效能考量不逐篇抓日期，同樣保留、標記 date=None。
+_CONTENT_BODY_SELECTORS = (
+    # 常見的文章內文容器 class／tag，依序嘗試，抓到第一個有內容的就停止。
+    {"name": "article"},
+    {"attrs": {"class": re.compile(r'article-?body', re.IGNORECASE)}},
+    {"attrs": {"class": re.compile(r'content', re.IGNORECASE)}},
+)
+_CONTENT_SNIPPET_MAX_LEN = 800
+_CONTENT_SNIPPET_PARAGRAPHS = 3
+
+
+def _extract_content_snippet(soup):
+    """取得用來做關鍵字比對的文章內容摘要，依優先順序嘗試：
+    1. <meta property="og:description">：CMS 產生的完整導言摘要，通常比搜尋結果列表頁
+       的截斷摘要更完整、更乾淨（見本檔案開頭 mirrormedia 案例：搜尋結果列表頁摘要
+       頭尾都被截斷、完全沒出現「宋念宇」，但 og:description 是完整導言，兩端都有）。
+    2. 文章內文前幾段 <p>：找常見的內文容器（article / class 含 content / article-body），
+       取前 2-3 段串接，避免抓到整篇全文（用不到，也拖慢比對／占用記憶體）。
+    3. <meta name="description">：次佳的頁面描述，某些站台沒有 og:description 但有這個。
+    4. 都找不到就回傳 None，呼叫端應退回列表頁摘要比對。
     """
-    to_check = matched[:max_candidates]
-    overflow = matched[max_candidates:]
+    og = soup.find("meta", attrs={"property": "og:description"})
+    if og and og.get("content") and og["content"].strip():
+        return og["content"].strip()[:_CONTENT_SNIPPET_MAX_LEN]
+
+    for sel in _CONTENT_BODY_SELECTORS:
+        container = soup.find(**sel)
+        if not container:
+            continue
+        paragraphs = container.find_all("p", limit=_CONTENT_SNIPPET_PARAGRAPHS)
+        text = " ".join(p.get_text(" ", strip=True) for p in paragraphs).strip()
+        if text:
+            return text[:_CONTENT_SNIPPET_MAX_LEN]
+
+    desc = soup.find("meta", attrs={"name": "description"})
+    if desc and desc.get("content") and desc["content"].strip():
+        return desc["content"].strip()[:_CONTENT_SNIPPET_MAX_LEN]
+
+    return None
+
+
+def _fetch_article_content_and_date(url, timeout=_ARTICLE_DATE_TIMEOUT):
+    """對單篇文章 URL 發一次 GET，同時擷取發布日期與內容摘要（見 `_extract_content_snippet`），
+    回傳 (date_or_None, snippet_or_None)。刻意合併成一次 fetch＋一次 BeautifulSoup 解析，
+    不要為了日期跟內容各發一次請求——這是為了替代舊版「只驗證列表頁摘要」的比對方式，
+    改成造訪文章真正的內容（見本檔案 `_verify_candidates` 上方的說明），如果每篇候選文章
+    都發兩次請求，等於直接把總搜尋時間翻倍，沒有必要。
+    失敗（網路錯誤、逾時、解析失敗）回傳 (None, None)，呼叫端應退回列表頁摘要比對，
+    不要因為多這一次驗證失敗就直接判定不符合。"""
+    try:
+        resp = requests.get(url, headers=_REQUEST_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None, None
+    if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+        resp.encoding = resp.apparent_encoding
+    try:
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return None, None
+    d = _extract_date_from_soup(soup, resp.text)
+    snippet = _extract_content_snippet(soup)
+    return d, snippet
+
+
+# 舊版的「先關鍵字比對、再另外抓一次日期」兩階段函式 `_attach_dates()` 已被下方的
+# `_verify_candidates()` 取代（日期跟內容摘要現在用同一次文章頁請求一起拿），
+# 所有 search_ 函式皆已改用新流程，不再需要獨立的 `_attach_dates()`。
+# 日期過濾／保留原則維持不變：只有「明確抓到日期、且確定不在範圍內」才排除，
+# 抓不到日期一律保留、標記 date=None，交給人工判斷。
+
+
+# ---------------------------------------------------------------------------
+# 內容驗證比對（取代「只看搜尋結果列表頁摘要」的關鍵字比對方式）
+#
+# 背景（2026-07-04 實測發現的漏抓案例）：鏡週刊 mirrormedia.mg 的搜尋結果列表頁
+# 摘要文字頭尾都被截斷（"...小宇感謝陳漢典...小宇的好友離世帶給他衝擊..."），
+# 從頭到尾都沒有出現使用者搜尋的本名「宋念宇」，即使文章本身確實是在講這個人
+# （標題只用暱稱「小宇」）。這不是特定站台的 bug，是「列表頁摘要本來就是被截斷過
+# 的行銷文案」這個資料來源本身的先天限制，不管怎麼調整比對邏輯都無法從列表頁摘要
+# 本身修好——真正能解決的方法只有造訪文章本頁，讀取完整的導言／內文再比對。
+#
+# 使用者已明確要求「準確比速度重要」，接受用較長的搜尋時間換取正確率，因此新的
+# 比對流程改成：先用站台自己的搜尋引擎判斷「這篇文章跟關鍵字有關」（只做 URL pattern
+# ＋標題長度的基本過濾，不在這一步驟就用列表頁摘要刷掉候選——因為列表頁摘要正是
+# 前述案例證明不可靠的資料來源），對每篇候選文章的「真正內容」（見
+# `_fetch_article_content_and_date` / `_extract_content_snippet`：優先用
+# og:description，其次抓內文前幾段）做關鍵字比對，比對規則沿用既有的
+# `_has_nickname_intro` 鄰接判斷（暱稱緊接本名才算數，避免「一堆人名逗號列舉」
+# 的雜訊誤判——這條規則今天稍早已經用來修過「蕭敬騰」案例的誤判，這裡刻意重用
+# 同一份邏輯，不另外寫一份更寬鬆的比對，維持前後一致的嚴謹標準）。
+# ---------------------------------------------------------------------------
+
+_CONTENT_VERIFY_MAX_CANDIDATES = 20  # 每個站台最多對幾篇候選文章做「造訪本文驗證」（效能考量）
+_CONTENT_VERIFY_MAX_WORKERS = 6  # 平行抓取的執行緒數
+
+
+def _candidate_filter(links, url_must_contain, min_len=6):
+    """比 `_filter()` 更寬鬆的第一階段過濾：只檢查 URL pattern（確定是文章頁，不是導覽列
+    ／分類頁連結）跟標題長度（濾掉空標題、純圖示連結等明顯雜訊），刻意「不」在這一步
+    做關鍵字比對——因為列表頁摘要本身不可靠（見上方模組說明），真正的關鍵字判斷留到
+    `_verify_candidates()` 造訪文章本頁之後才做。回傳 list of {"title","url","context"}，
+    `context` 保留列表頁摘要，供內容驗證失敗時的退回比對使用。
+    """
+    seen, results = set(), []
+    for it in links:
+        href, title = it["href"], it["title"]
+        if href in seen:
+            continue
+        if not any(s in href for s in url_must_contain):
+            continue
+        if len(title) < min_len:
+            continue
+        seen.add(href)
+        results.append({"title": _clean_title(title), "url": href, "context": it.get("context") or ""})
+    return results
+
+
+def _content_keyword_match(title, snippet, keywords):
+    """文章本頁內容驗證用的關鍵字命中判斷。跟 `_filter()` 的邏輯保持一致的嚴謹標準：
+    標題命中永遠算數（便宜、可信）；內容摘要則同時接受「暱稱緊接本名」的鄰接比對
+    （`_has_nickname_intro`，跟列表頁摘要比對用同一份規則），以及「關鍵字整段直接
+    出現在摘要、且不是逗號/頓號列舉雜訊的一部分」的子字串比對。
+
+    這裡原本想單純用「關鍵字有出現在摘要就算命中」（比列表頁摘要比對更寬鬆一點，
+    理由是 og:description／內文前幾段通常是 CMS 寫的完整導言散文，不是「一堆人名
+    逗號列舉」的雜訊來源）——但實測驗證蕭敬騰基準案例時發現這個假設不成立：
+    自由時報一篇報導的 og:description 內容是「...曾參與「Faye」詹雯婷、羅大佑、
+    蕭敬騰等大咖音樂人現場演出...」，關鍵字前面剛好是「、」，証明列舉雜訊一樣會
+    出現在文章導言裡，不是只有列表頁的「相關文章」推薦區塊才有。所以子字串比對
+    這裡加一道跟 `_has_nickname_intro` 同精神的列舉分隔符號防呆：只要關鍵字緊鄰
+    （前一個字或後一個字）逗號/頓號，就視為列舉雜訊、不算單純子字串命中（但仍可能
+    透過 `_has_nickname_intro` 命中，只是這裡故意更嚴格一點，避免走回頭路重現
+    今天稍早修過的「蕭敬騰／羅大佑」誤判）。
+    """
+    for k in keywords:
+        if k in title:
+            return True
+        if not snippet:
+            continue
+        if _has_nickname_intro(snippet, k):
+            return True
+        idx = snippet.find(k)
+        if idx == -1:
+            continue
+        before = snippet[idx - 1] if idx > 0 else ""
+        after_idx = idx + len(k)
+        after = snippet[after_idx] if after_idx < len(snippet) else ""
+        if before in "，,、" or after in "，,、":
+            continue  # 列舉雜訊（例如「詹雯婷、羅大佑、蕭敬騰等」），不算命中
+        return True
+    return False
+
+
+def _verify_candidates(candidates, keyword, start_date, end_date,
+                        max_candidates=_CONTENT_VERIFY_MAX_CANDIDATES,
+                        timeout=_ARTICLE_DATE_TIMEOUT):
+    """新版核心比對流程，取代舊版「_filter()（列表頁摘要判斷）→ _attach_dates()（另外
+    抓日期）」兩階段。輸入 candidates 是 `_candidate_filter()` 的輸出（只做過 URL／
+    標題長度過濾，尚未判斷關鍵字是否命中）。
+
+    對前 max_candidates 篇候選文章：平行造訪文章本頁一次，同時拿到日期與內容摘要，
+    最終命中判斷＝標題命中 or 內容摘要命中（`_content_keyword_match`）。如果這次額外的
+    造訪失敗（網路錯誤、逾時、頁面解析不到任何內容摘要），退回用列表頁摘要做舊版
+    `_has_nickname_intro` 比對（優雅降級，不能因為多做的驗證步驟失敗就直接放棄這篇候選）。
+
+    超過 max_candidates 篇的候選，因效能考量不逐篇造訪本頁，同樣退回列表頁摘要比對
+    （沿用舊版 `_filter()` 對「量太大」候選的處理精神：與其整批不驗證直接漏掉，
+    不如用比較弱但至少有機會抓到的舊版比對規則）。
+
+    日期過濾原則跟舊版 `_attach_dates()` 一致：只有「明確抓到日期、且確定不在範圍內」
+    才排除；抓不到日期一律保留、標記 date=None，交給人工判斷。
+    """
+    keywords = [keyword] if isinstance(keyword, str) else keyword
+    to_verify = candidates[:max_candidates]
+    overflow = candidates[max_candidates:]
     results = []
-    if to_check:
-        with ThreadPoolExecutor(max_workers=_ARTICLE_DATE_MAX_WORKERS) as executor:
-            future_to_item = {executor.submit(_fetch_article_date, m["url"]): m for m in to_check}
+
+    if to_verify:
+        with ThreadPoolExecutor(max_workers=_CONTENT_VERIFY_MAX_WORKERS) as executor:
+            future_to_item = {
+                executor.submit(_fetch_article_content_and_date, c["url"], timeout): c for c in to_verify
+            }
             for future in as_completed(future_to_item):
-                m = future_to_item[future]
+                c = future_to_item[future]
                 try:
-                    d = future.result()
+                    d, snippet = future.result()
                 except Exception:
-                    d = None
+                    d, snippet = None, None
+
+                if snippet is not None:
+                    # 成功造訪文章本頁：用內容摘要做最終判斷
+                    if not _content_keyword_match(c["title"], snippet, keywords):
+                        continue
+                else:
+                    # 造訪失敗／抓不到內容摘要：優雅降級，退回列表頁摘要比對
+                    if not any(k in c["title"] or _has_nickname_intro(c["context"], k) for k in keywords):
+                        continue
+
                 if d is not None and not (start_date <= d <= end_date):
                     continue
-                results.append({"title": m["title"], "url": m["url"], "date": d})
-    for m in overflow:
-        results.append({"title": m["title"], "url": m["url"], "date": None})
-    # 保持原始（關鍵字比對）順序，而不是 as_completed 的完成順序
-    order = {m["url"]: i for i, m in enumerate(matched)}
+                results.append({"title": c["title"], "url": c["url"], "date": d})
+
+    for c in overflow:
+        if not any(k in c["title"] or _has_nickname_intro(c["context"], k) for k in keywords):
+            continue
+        results.append({"title": c["title"], "url": c["url"], "date": None})
+
+    # 保持原始（候選）順序，而不是 as_completed 的完成順序
+    order = {c["url"]: i for i, c in enumerate(candidates)}
     results.sort(key=lambda r: order.get(r["url"], 0))
     return results
 
@@ -395,94 +545,64 @@ def search_ltn(page, keyword, start_date, end_date):
     )
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["ltn.com.tw/news/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["ltn.com.tw/news/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_appledaily(page, keyword, start_date, end_date):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+    日期改交給 `_verify_candidates()` 內建的文章頁日期擷取 cascade（比舊版單純從網址猜
+    日期更準確，網址裡的日期片段有時是發稿系統的建檔時間，不一定等於實際發布時間）；
+    如果文章頁擷取失敗，`_verify_candidates()` 對 date=None 一律保留、交給人工判斷，
+    不會比舊版（URL 解析失敗時同樣是 date=None）更嚴格。"""
     kw = quote(keyword)
     url = f"https://news.nextapple.com/search/{kw}?sort=date"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["nextapple.com/entertainment/", "nextapple.com/life/", "nextapple.com/local/"])
-    results = []
-    for m in matched:
-        d = parse_date_from_url(m["url"])
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": m["title"], "url": m["url"], "date": d})
-    return results
+    candidates = _candidate_filter(links, ["nextapple.com/entertainment/", "nextapple.com/life/", "nextapple.com/local/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_tvbs(page, keyword, start_date, end_date):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+    日期改交給 `_verify_candidates()` 內建的文章頁日期擷取 cascade，比舊版從列表頁
+    「3小時前」這類相對時間字串換算更精確（相對時間換算本來就有±1天的誤差風險）。"""
     kw = quote(keyword)
     url = f"https://news.tvbs.com.tw/news/searchresult/{kw}/news"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["tvbs.com.tw/entertainment/", "tvbs.com.tw/life/", "tvbs.com.tw/local/"])
-    url_to_text = {}
-    if soup is not None:
-        for li in soup.find_all("li"):
-            a = li.find("a", href=lambda h: h and "tvbs.com.tw" in h)
-            if a:
-                href = urljoin(url, a["href"])
-                url_to_text.setdefault(href, li.get_text())
-    results = []
-    for m in matched:
-        text = url_to_text.get(m["url"], "")
-        d = parse_relative_or_absolute(text, TODAY)
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": m["title"], "url": m["url"], "date": d})
-    return results
+    candidates = _candidate_filter(links, ["tvbs.com.tw/entertainment/", "tvbs.com.tw/life/", "tvbs.com.tw/local/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_chinatimes(page, keyword, start_date, end_date):
-    """維持 Playwright：網站有 Cloudflare JS 挑戰頁（"Just a moment..."），
-    純 requests 呼叫會被擋下回傳 403，需要真實瀏覽器執行 JS 才能通過驗證並取得搜尋結果。"""
+    """搜尋結果列表頁維持 Playwright：網站有 Cloudflare JS 挑戰頁（"Just a moment..."），
+    純 requests 呼叫會被擋下回傳 403，需要真實瀏覽器執行 JS 才能通過驗證並取得搜尋結果。
+    但個別「文章頁」（不是搜尋結果頁）通常沒有這層 Cloudflare 挑戰，`_verify_candidates()`
+    內部用 plain requests 造訪文章頁做內容驗證＋日期擷取即可，不需要另外開瀏覽器分頁
+    （已實測確認個別文章頁可用 requests 正常取得）；如果之後發現文章頁其實也被擋，
+    `_verify_candidates()` 的「內容抓取失敗就退回列表頁摘要比對」機制會自動優雅降級，
+    不會整批漏收。"""
     kw = quote(keyword)
     url = f"https://www.chinatimes.com/search/{kw}?page=1&chdtv"
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(1200)
     links = _all_links(page)
-    matched = _filter(links, keyword, ["chinatimes.com/realtimenews/", "chinatimes.com/newspapers/"])
-    results = []
-    for m in matched:
-        d = parse_date_from_url(m["url"])
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": m["title"], "url": m["url"], "date": d})
-    return results
+    candidates = _candidate_filter(links, ["chinatimes.com/realtimenews/", "chinatimes.com/newspapers/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_ettoday(page, keyword, start_date, end_date):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+    日期改交給 `_verify_candidates()` 內建的文章頁日期擷取 cascade，取代舊版從列表頁
+    附近 <div> 文字用 regex 挖 YYYY-MM-DD 的做法（該做法依賴列表頁版型穩定，文章頁的
+    meta tag／JSON-LD 日期更穩定可靠）。"""
     kw = quote(keyword)
     url = f"https://www.ettoday.net/news_search/doSearch.php?keywords={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["star.ettoday.net/news/", "ettoday.net/news/20"])
-    url_to_text = {}
-    if soup is not None:
-        for div in soup.find_all("div"):
-            a = div.find("a", href=lambda h: h and "ettoday.net/news" in h)
-            text = div.get_text()
-            if a and re.search(r'\d{4}-\d{2}-\d{2}', text):
-                href = urljoin(url, a["href"])
-                url_to_text.setdefault(href, text)
-    results = []
-    for m in matched:
-        text = url_to_text.get(m["url"], "")
-        d = None
-        dm = re.search(r'(\d{4})-(\d{2})-(\d{2})', text)
-        if dm:
-            d = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": m["title"], "url": m["url"], "date": d})
-    return results
+    candidates = _candidate_filter(links, ["star.ettoday.net/news/", "ettoday.net/news/20"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_udn(page, keyword, start_date, end_date):
@@ -491,33 +611,30 @@ def search_udn(page, keyword, start_date, end_date):
     url = f"https://udn.com/search/word/2/{kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["stars.udn.com/star/story/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["stars.udn.com/star/story/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_mirror(page, keyword, start_date, end_date):
     """維持 Playwright：mirrordaily.news 的搜尋結果由前端 React 元件動態渲染，
-    純 requests 拿到的 HTML 只有頁尾靜態連結，抓不到實際搜尋結果，須執行 JS 才能取得。"""
+    純 requests 拿到的 HTML 只有頁尾靜態連結，抓不到實際搜尋結果，須執行 JS 才能取得。
+    列表頁的卡片標題文字前面會夾帶「YYYY/MM/DD HH:MM:SS」時間戳、後面接搜尋摘要，
+    這裡先把標題清乾淨（跟原本邏輯一致），日期部分改交給 `_verify_candidates()` 內建的
+    文章頁日期擷取 cascade（比從列表頁標題文字 regex 挖時間戳更穩定）。"""
     kw = quote(keyword)
     url = f"https://www.mirrordaily.news/search?q={kw}"
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(1200)
     links = _all_links(page)
-    matched = _filter(links, keyword, ["mirrordaily.news/story/"])
-    results = []
-    for m in matched:
-        title = m["title"]
-        d = None
+    for it in links:
+        title = it["title"]
         dm = re.match(r'^(\d{4})/(\d{2})/(\d{2})\s+\d{2}:\d{2}:\d{2}\s*(.*)$', title, re.S)
         if dm:
-            d = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
             title = dm.group(4).strip()
         # 清掉搜尋結果摘要（第二行以後的介紹文字）
-        title = title.split("\n")[0].strip()
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": title, "url": m["url"], "date": d})
-    return results
+        it["title"] = title.split("\n")[0].strip()
+    candidates = _candidate_filter(links, ["mirrordaily.news/story/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_yahoo(page, keyword, start_date, end_date):
@@ -526,8 +643,8 @@ def search_yahoo(page, keyword, start_date, end_date):
     url = f"https://tw.news.yahoo.com/search?p={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["tw.news.yahoo.com/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["tw.news.yahoo.com/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_ctwant(page, keyword, start_date, end_date):
@@ -536,16 +653,22 @@ def search_ctwant(page, keyword, start_date, end_date):
     url = f"https://www.ctwant.com/search/{kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["ctwant.com/article/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["ctwant.com/article/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_mirrormedia(page, keyword, start_date, end_date):
     """鏡週刊 mirrormedia.mg（與既有的「鏡報」mirrordaily.news 是不同網站）。
     維持 Playwright：搜尋結果由前端 miso 搜尋元件（React）動態載入，純 requests
     拿到的 HTML 裡 `a.miso-list__item-body` 選擇器抓不到任何項目，需要 JS 執行。
-    改用共用的 `_filter()`（含暱稱比對），並把整張卡的文字一併當 context 傳入，
-    不再只比對標題本身——原本這裡是各自土砲的嚴格比對，沒套用到暱稱比對修正。"""
+
+    這裡是本次「造訪文章本頁驗證」改版的起因案例：這個站台的搜尋結果列表頁摘要
+    頭尾都被截斷（例如「...小宇感謝陳漢典...小宇的好友離世帶給他衝擊...」），完全
+    不會出現使用者搜尋的本名「宋念宇」，即使文章確實是在講這個人（標題只用暱稱
+    「小宇」）。改用 `_candidate_filter()`＋`_verify_candidates()`：只用 URL pattern
+    做基本過濾，真正的關鍵字判斷改成造訪文章本頁的 og:description（已實測確認會
+    包含「小宇 宋念宇」——暱稱緊接本名，`_has_nickname_intro` 抓得到），不再只信任
+    列表頁摘要。"""
     kw = quote(keyword)
     url = f"https://www.mirrormedia.mg/search/{kw}"
     page.goto(url, timeout=20000, wait_until="load")
@@ -558,35 +681,27 @@ def search_mirrormedia(page, keyword, start_date, end_date):
     except Exception:
         items = []
     links = [{"title": (it["title"] or "").strip(), "href": it["href"], "context": it.get("context")} for it in items]
-    matched = _filter(links, keyword, ["mirrormedia.mg/story/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["mirrormedia.mg/story/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_mnews(page, keyword, start_date, end_date):
     """鏡新聞 mnews.tw（鏡電視旗下新聞台，與「鏡週刊」「鏡報」為不同網站）。
     維持 Playwright：純 requests 取得的 HTML 中關鍵字完全不存在（搜尋結果純前端渲染），
-    需要真實瀏覽器執行 JS 才能取得結果。"""
+    需要真實瀏覽器執行 JS 才能取得結果（僅指搜尋列表頁；個別文章頁已實測可用 plain
+    requests 正常取得，`_verify_candidates()` 內部造訪文章頁不需要瀏覽器）。
+    列表頁卡片標題會夾帶「YYYY.MM.DD HH:MM」時間戳，這裡先清掉（跟原本邏輯一致，
+    純粹是顯示用標題清理），日期比對改交給 `_verify_candidates()` 內建的文章頁
+    日期擷取 cascade。"""
     kw = quote(keyword)
     url = f"https://www.mnews.tw/search/{kw}"
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(3000)
     links = _all_links(page)
-    matched = _filter(links, keyword, ["mnews.tw/story/"])
-    results = []
-    for m in matched:
-        title = m["title"]
-        d = None
-        dm = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', title)
-        if dm:
-            try:
-                d = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
-            except ValueError:
-                d = None
-            title = re.sub(r'\d{4}\.\d{2}\.\d{2}\s*\d{2}:\d{2}', '', title).strip()
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": title, "url": m["url"], "date": d})
-    return results
+    for it in links:
+        it["title"] = re.sub(r'\d{4}\.\d{2}\.\d{2}\s*\d{2}:\d{2}', '', it["title"]).strip()
+    candidates = _candidate_filter(links, ["mnews.tw/story/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_ctinews(page, keyword, start_date, end_date):
@@ -595,20 +710,23 @@ def search_ctinews(page, keyword, start_date, end_date):
     url = f"https://ctinews.com/search/{kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["ctinews.com/news/items/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["ctinews.com/news/items/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_ftvnews(page, keyword, start_date, end_date):
-    """維持 Playwright：網站有 Cloudflare JS 挑戰頁（"Just a moment..."），
-    純 requests 呼叫會被擋下回傳 403，需要真實瀏覽器執行 JS 才能通過驗證並取得搜尋結果。"""
+    """搜尋結果列表頁維持 Playwright：網站有 Cloudflare JS 挑戰頁（"Just a moment..."），
+    純 requests 呼叫會被擋下回傳 403，需要真實瀏覽器執行 JS 才能通過驗證並取得搜尋結果。
+    個別文章頁若同樣被 Cloudflare 擋下，`_verify_candidates()` 的 `_fetch_article_content_and_date`
+    會直接請求失敗（RequestException），此時會自動退回列表頁摘要比對／date=None 保留，
+    不會整批漏收，只是這種情況下拿不到內容驗證的準確度優勢。"""
     kw = quote(keyword)
     url = f"https://www.ftvnews.com.tw/search/{kw}"
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(1500)
     links = _all_links(page)
-    matched = _filter(links, keyword, ["ftvnews.com.tw/news/detail/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["ftvnews.com.tw/news/detail/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_owlnews(page, keyword, start_date, end_date):
@@ -619,31 +737,20 @@ def search_owlnews(page, keyword, start_date, end_date):
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(2500)
     links = _all_links(page)
-    matched = _filter(links, keyword, ["news.owlting.com/articles/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["news.owlting.com/articles/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_ftnn(page, keyword, start_date, end_date):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+    日期改交給 `_verify_candidates()` 內建的文章頁日期擷取 cascade，取代舊版從標題文字
+    regex 挖 YYYY.MM.DD 的做法。"""
     kw = quote(keyword)
     url = f"https://www.ftnn.com.tw/search?keyword={kw}&all=true"
     soup = _get_soup(url, timeout=35)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["ftnn.com.tw/news/"])
-    results = []
-    for m in matched:
-        title = m["title"]
-        d = None
-        dm = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', title)
-        if dm:
-            try:
-                d = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
-            except ValueError:
-                d = None
-        if d and not (start_date <= d <= end_date):
-            continue
-        results.append({"title": title, "url": m["url"], "date": d})
-    return results
+    candidates = _candidate_filter(links, ["ftnn.com.tw/news/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_life(page, keyword, start_date, end_date):
@@ -652,8 +759,8 @@ def search_life(page, keyword, start_date, end_date):
     url = f"https://life.tw/?app=search&keyword={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["life.tw/article/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["life.tw/article/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_juksy(page, keyword, start_date, end_date):
@@ -663,8 +770,8 @@ def search_juksy(page, keyword, start_date, end_date):
     url = f"https://www.juksy.com/?s={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["juksy.com/article/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["juksy.com/article/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_premiermedia(page, keyword, start_date, end_date):
@@ -673,8 +780,8 @@ def search_premiermedia(page, keyword, start_date, end_date):
     url = f"https://www.premiermedia.com.tw/?s={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["premiermedia.com.tw/20"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["premiermedia.com.tw/20"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_findnewstoday(page, keyword, start_date, end_date):
@@ -683,8 +790,8 @@ def search_findnewstoday(page, keyword, start_date, end_date):
     url = f"https://findnewstoday.net/?s={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["findnewstoday.net/archives/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["findnewstoday.net/archives/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_taiwanpost(page, keyword, start_date, end_date):
@@ -693,8 +800,8 @@ def search_taiwanpost(page, keyword, start_date, end_date):
     url = f"https://taiwanpost.net/?s={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["taiwanpost.net/20"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["taiwanpost.net/20"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_mypeople(page, keyword, start_date, end_date):
@@ -703,8 +810,8 @@ def search_mypeople(page, keyword, start_date, end_date):
     url = f"https://mypeoplevol.com/?s={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["mypeoplevol.com/20"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["mypeoplevol.com/20"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_ponews(page, keyword, start_date, end_date):
@@ -713,8 +820,8 @@ def search_ponews(page, keyword, start_date, end_date):
     url = f"https://www.po-news.net/search?q={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["po-news.net/20"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["po-news.net/20"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_hualientoday(page, keyword, start_date, end_date):
@@ -723,8 +830,8 @@ def search_hualientoday(page, keyword, start_date, end_date):
     url = f"https://hualien-today.com/?s={kw}"
     soup = _get_soup(url, timeout=30)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["hualien-today.com/news.php?listno="])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["hualien-today.com/news.php?listno="])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_insightpost(page, keyword, start_date, end_date):
@@ -736,8 +843,8 @@ def search_insightpost(page, keyword, start_date, end_date):
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(1500)
     links = _all_links(page)
-    matched = _filter(links, keyword, ["insight-post.tw/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["insight-post.tw/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_starsetn(page, keyword, start_date, end_date):
@@ -747,12 +854,22 @@ def search_starsetn(page, keyword, start_date, end_date):
     url = f"https://star.setn.com/search/{kw}/"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    matched = _filter(links, keyword, ["star.setn.com/news/"])
-    return _attach_dates(matched, start_date, end_date)
+    candidates = _candidate_filter(links, ["star.setn.com/news/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date)
 
 
 def search_googlenews(page, keyword, start_date, end_date):
-    """Google 新聞 RSS 搜尋（聚合各媒體報導，不需要 Playwright page）"""
+    """Google 新聞 RSS 搜尋（聚合各媒體報導，不需要 Playwright page）。
+    刻意不套用本次新增的「造訪文章本頁驗證」流程（`_verify_candidates()`）：Google News RSS
+    回傳的 <link> 不是文章真正的網址，而是 Google 自己的轉址短碼（例如
+    news.google.com/rss/articles/CBMi...），要拿到真正的文章網址得先讓瀏覽器執行一段
+    client-side redirect，plain requests 直接 GET 這個網址通常只會拿到轉址頁本身，
+    抓不到目標文章的內容——這跟其他站台「文章網址本來就是真的，只是列表頁摘要不可靠」
+    的情境不一樣，這裡要驗證的話等於要多一層「先解析出真正網址」的機制，複雜度／
+    額外請求數不成比例（這個來源本身是聚合上百篇其他站台文章的入口，只是給使用者
+    看有沒有露出、真正的完整報導使用者會點進去看，不是本比對系統唯一的正確性防線）。
+    維持原本「關鍵字必須出現在標題」的比對（比 `_filter()` 標準略嚴格，因為沒有摘要
+    可以做暱稱鄰接比對），跟其他站台一致的地方是：仍然不接受更寬鬆的比對規則。"""
     url = f"https://news.google.com/rss/search?q={quote(keyword)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
