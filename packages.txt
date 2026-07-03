@@ -1,0 +1,23 @@
+# Streamlit Community Cloud 的 apt 相依套件清單。
+# 這裡列出的是 headless Chromium（Playwright 使用）在 Debian 環境下需要的系統函式庫，
+# 對應 `playwright install-deps chromium` 會安裝的套件。只有 7/26 個站台仍需要
+# Playwright（其餘已改用 requests，不需要瀏覽器），但只要有一個站台需要，
+# 整個 app 環境還是得裝這些套件瀏覽器才能啟動。
+libnss3
+libnspr4
+libatk1.0-0
+libatk-bridge2.0-0
+libcups2
+libdrm2
+libxkbcommon0
+libxcomposite1
+libxdamage1
+libxfixes3
+libxrandr2
+libgbm1
+libpango-1.0-0
+libcairo2
+libasound2
+libatspi2.0-0
+libwayland-client0
+fonts-noto-cjk

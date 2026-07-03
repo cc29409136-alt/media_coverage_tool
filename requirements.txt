@@ -1,0 +1,12 @@
+streamlit>=1.40
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+python-docx>=1.1
+
+# Playwright 只有 7/26 個站台仍需要（Cloudflare JS 挑戰頁 / 前端 JS 動態渲染的站台），
+# 其餘 19 個站台已改用 requests + BeautifulSoup。若未來把這 7 個站台也淘汰，
+# 可以移除這一行並停用 headless Chromium，讓部署更輕量。
+# 於 Streamlit Community Cloud 上請同時搭配 packages.txt（apt 相依套件）使用，
+# 且 app.py 會在第一次需要瀏覽器時自動執行 `playwright install chromium`。
+playwright>=1.48,<1.61

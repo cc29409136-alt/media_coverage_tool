@@ -1,0 +1,13 @@
+[theme]
+# 暖珊瑚橘：呼應電商直播（蝦皮等平台）的活力調性，同時保留專業乾淨的底色，
+# 適合作為 TSA Group 內部工具的品牌識別色。
+primaryColor = "#FF6B4A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F3EF"
+textColor = "#2B2523"
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = true
+enableXsrfProtection = false
