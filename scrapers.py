@@ -25,17 +25,22 @@ _EXTRACT_ALL_LINKS = """
 els => els.map(e => {
     const titleEl = e.querySelector('h1, h2, h3, h4, [class*="title" i], [class*="headline" i]');
     const title = (titleEl ? titleEl.textContent : e.textContent).trim();
+    const ownText = e.textContent.trim();
     let context = null;
-    let node = e;
-    for (let i = 0; i < 4; i++) {
-        const parent = node.parentElement;
-        if (!parent) break;
-        const text = parent.textContent.trim();
-        if (text.length >= 20) {
-            if (text.length <= 600) context = text;
-            break;
+    if (ownText.length > 30) {
+        context = ownText;
+    } else {
+        let node = e;
+        for (let i = 0; i < 4; i++) {
+            const parent = node.parentElement;
+            if (!parent) break;
+            const text = parent.textContent.trim();
+            if (text.length >= 20) {
+                if (text.length <= 600) context = text;
+                break;
+            }
+            node = parent;
         }
-        node = parent;
     }
     return {title, href: e.href, context};
 })
@@ -80,13 +85,17 @@ def _clean_title(title):
     return title.strip()
 
 
-# 中文新聞介紹藝人本名的慣用句型：「暱稱」緊接著本名，例如「小宇」宋念宇、
-# 「老蕭」蕭敬騰。只信任這種緊鄰的引號＋姓名組合，而不是「關鍵字出現在摘要
-# 裡任何地方」——後者太寬鬆，會把「文章只是順帶提到這個人名字」的雜訊也
-# 誤判為相關報導（例如某篇報導列舉多位音樂人名字，其中剛好包含搜尋的關鍵字，
-# 但那篇報導其實跟這個人無關）。
+# 中文新聞介紹藝人本名的慣用句型：暱稱緊接著本名，例如「小宇」宋念宇、
+# 「老蕭」蕭敬騰，但也有不加引號直接寫「小宇宋念宇」的寫法。判斷原則：
+# 只要關鍵字前面「不是」逗號/頓號這種列舉分隔符號（也不是文字開頭），就視為
+# 緊鄰介紹句型、算命中；如果前面剛好是逗號/頓號，代表這是「一堆人名用頓號
+# 列舉」的雜訊寫法（例如某篇報導列出多位音樂人名字，其中剛好包含搜尋的關鍵字，
+# 但文章其實跟這個人無關），不算命中。
 def _has_nickname_intro(text, keyword):
-    return re.search(r'」\s{0,2}' + re.escape(keyword), text) is not None
+    idx = text.find(keyword)
+    if idx <= 0:
+        return False
+    return text[idx - 1] not in "，,、 \n\t"
 
 
 def _filter(links, keyword, url_must_contain, min_len=6):
@@ -164,10 +173,21 @@ _CONTEXT_MAX_LEN = 600
 
 
 def _extract_link_context(a):
-    """往上找最近一層「合理大小」的父層容器文字，當作關鍵字比對用的 context
-    （標題＋摘要），邏輯跟 JS 版 `_EXTRACT_ALL_LINKS` 一致。容器太大（可能是
-    整個版面外層，混進不相關內容）就放棄，回傳 None，讓呼叫端退回只比對標題。
+    """取得關鍵字比對用的 context 文字（標題＋摘要）。
+    有些卡片式版型把整張卡（標題＋摘要＋更多按鈕）整包塞進同一個 <a> 標籤
+    （`_extract_link_title` 會從裡面挑出乾淨的標題子元素，但 <a> 自己完整的
+    `get_text()` 仍然包含摘要全文）——這種情況下 <a> 自己的完整文字就是最準確
+    的 context，不需要、也不應該往上找父層容器，因為父層容器常常是「一整頁全部
+    搜尋結果」的共用外層，會把好幾篇文章的文字混在一起，反而抓不到正確範圍
+    （這是實際踩到的 bug：CTWANT 的搜尋結果頁把 20 篇文章全部包在同一層 <div>
+    裡，往上找父層容器只會拿到 20000+ 字的大雜燴，遠超長度上限直接被放棄）。
+    只有當 <a> 自己的文字就只是標題本身、沒有額外摘要內容時，才退而求其次往上
+    找父層容器（適用「標題」與「摘要」是分開的兄弟元素、而非同一個 <a> 的版型，
+    例如 LTN 的 <li> 卡片）；父層容器一樣要做長度上限防呆，避免抓到共用外層。
     """
+    own_text = a.get_text(strip=True)
+    if len(own_text) > 30:
+        return own_text
     node = a
     for _ in range(4):
         parent = node.parent
