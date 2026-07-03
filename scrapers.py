@@ -15,7 +15,16 @@ from matcher import parse_relative_or_absolute, parse_date_from_url
 
 TODAY = date.today()
 
-_EXTRACT_ALL_LINKS = "els => els.map(e => ({title: e.textContent.trim(), href: e.href}))"
+# 跟 Python 版 `_extract_link_title()` 邏輯一致：卡片式版型常把整張卡（圖片＋
+# 標題＋摘要＋更多按鈕）包在同一個 <a> 裡，優先找內部的標題子元素（h1~h4 或
+# class 含 title/headline），找不到才退回整個 <a> 的文字。
+_EXTRACT_ALL_LINKS = """
+els => els.map(e => {
+    const titleEl = e.querySelector('h1, h2, h3, h4, [class*="title" i], [class*="headline" i]');
+    const title = (titleEl ? titleEl.textContent : e.textContent).trim();
+    return {title, href: e.href};
+})
+"""
 
 _REQUEST_HEADERS = {
     "User-Agent": USER_AGENT,
