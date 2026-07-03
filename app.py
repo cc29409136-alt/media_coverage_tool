@@ -104,8 +104,11 @@ with st.container(border=True):
             )
 
         press_release = st.text_area(
-            "新聞稿全文（選填，先貼上留存，未來版本會用來做更精準的比對）",
+            "新聞稿全文（選填，貼上後會用來比對文章內容相似度，提高比對準確率）",
             height=120,
+            help="貼上完整新聞稿全文（建議 30 字以上才會生效）：系統會拿候選文章的內容"
+                 "跟新聞稿比對相似度，用來排除「有提到關鍵字但其實是別的新聞」的誤判，"
+                 "並抓出用詞改寫但確實是同一則新聞的報導。留空則沿用原本只看關鍵字的比對方式。",
         )
         submitted = st.form_submit_button("🔍 開始搜尋", use_container_width=True, type="primary")
 
@@ -144,7 +147,9 @@ if submitted:
             articles_by_url = {}
             for kw in keywords:
                 try:
-                    kw_articles = func(page, kw, start_date, end_date) if func else []
+                    kw_articles = (
+                        func(page, kw, start_date, end_date, press_release_text=press_release) if func else []
+                    )
                 except Exception as e:
                     kw_articles = []
                     st.warning(f"{site['name']}（{kw}）搜尋失敗：{e}")

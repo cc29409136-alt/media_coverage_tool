@@ -56,6 +56,52 @@ def title_similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
+# 新聞稿全文比對用的最小長度門檻：使用者可能只是隨手貼一小段測試文字，不到這個
+# 長度就不當成「真的貼了新聞稿」，一律走沒有新聞稿的舊版比對邏輯（見
+# scrapers.py `_content_keyword_match` 的呼叫端判斷）。
+PRESS_RELEASE_MIN_LEN = 30
+
+# 新聞稿相似度分數門檻，經實測（見下方 press_release_similarity 說明）校準：
+# - 高信心門檻：即使關鍵字/暱稱鄰接比對沒有命中，相似度單獨達到這個分數也視為命中
+#   （處理文章大幅改寫新聞稿、暱稱鄰接句型比對不到，但內容明顯是同一則新聞的情況）。
+# - 一般門檻：關鍵字/暱稱鄰接比對已經命中時，用這個（較低的）門檻做「佐證」——
+#   確認文章內容真的跟新聞稿相關，藉此濾掉「關鍵字命中但其實是另一則新聞」的
+#   誤判（例如藝人以固定班底/導師身份出現在另一個節目的報導）。
+PRESS_RELEASE_HIGH_THRESHOLD = 0.20
+PRESS_RELEASE_CORROBORATE_THRESHOLD = 0.12
+
+_PR_STRIP_RE = re.compile(r'[\s「」！?？、,，.。/／|｜:：\-—()（）\d]')
+
+
+def press_release_similarity(press_release_text, article_content):
+    """計算使用者貼上的新聞稿全文跟候選文章內容（`_extract_content_snippet()` 抓到的
+    og:description／內文前幾段摘要，複用同一份 fetch，不重新抓取）之間的相似度。
+
+    比對方式：整段文字（去除標點符號／數字／空白後）直接丟給 `SequenceMatcher.ratio()`，
+    跟既有 `title_similarity()` 手法一致（本專案已有先例：`title_similarity` 用在轉載
+    來源比對）。曾實測比較過「n-gram shingle 重疊率」（將兩段文字切成固定長度的
+    重疊字元窗口，計算文章端窗口有多少比例也出現在新聞稿中）——結果 shingle 重疊率
+    在中文語境下太脆弱：新聞稿跟報導幾乎不會有連續 6~12 個字完全相同的片段（記者一定會
+    改寫用詞語序），導致真正相關的文章也幾乎測不到重疊（實測 n=8~12 時真陽性分數全部
+    掉到 0），反而 `SequenceMatcher.ratio()` 的 opcode 比對機制本身就能找出「不連續但
+    大致對齊」的相似片段，對「文章是新聞稿的短版改寫」這種情境更穩健。
+
+    實測數據（見開發時的腳本，使用今天測試過的真實案例）：
+    - 真陽性（同一則「我還有個夢」MV／陳漢典好孕棉哏報導的改寫版）：ratio 約 0.26～0.36
+    - 假陽性（「為你唱情歌」「原子少年」等文章，宋念宇只是掛名導師，內容其實是另一則新聞）：
+      ratio 約 0.07～0.14（含刻意構造的「較難」假陽性案例，內容更長、也提及一些新聞稿
+      相關字詞如「五年」「新作品」，ratio 仍只有 0.096）
+    因此以 0.20 作為「高信心」門檻、0.12 作為「佐證」門檻，兩者之間有足夠安全邊界。
+    """
+    if not press_release_text or not article_content:
+        return 0.0
+    a = _PR_STRIP_RE.sub('', press_release_text)
+    b = _PR_STRIP_RE.sub('', article_content)
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def find_origin_match(title, original_articles, threshold=0.55):
     """在已抓到的原生媒體結果中，找出跟這篇轉載標題最相似的來源，回傳媒體名稱或 None"""
     best_score, best_site = 0, None
