@@ -18,11 +18,26 @@ TODAY = date.today()
 # 跟 Python 版 `_extract_link_title()` 邏輯一致：卡片式版型常把整張卡（圖片＋
 # 標題＋摘要＋更多按鈕）包在同一個 <a> 裡，優先找內部的標題子元素（h1~h4 或
 # class 含 title/headline），找不到才退回整個 <a> 的文字。
+# 同時往上找最近一層「合理大小」的父層容器文字當作 context，用來比對關鍵字——
+# 很多新聞標題只寫藝人的暱稱/藝名（例如「小宇」），本名（例如「宋念宇」）只會
+# 出現在摘要段落裡，只看標題會漏掉這些真正相關的報導。
 _EXTRACT_ALL_LINKS = """
 els => els.map(e => {
     const titleEl = e.querySelector('h1, h2, h3, h4, [class*="title" i], [class*="headline" i]');
     const title = (titleEl ? titleEl.textContent : e.textContent).trim();
-    return {title, href: e.href};
+    let context = null;
+    let node = e;
+    for (let i = 0; i < 4; i++) {
+        const parent = node.parentElement;
+        if (!parent) break;
+        const text = parent.textContent.trim();
+        if (text.length >= 20) {
+            if (text.length <= 600) context = text;
+            break;
+        }
+        node = parent;
+    }
+    return {title, href: e.href, context};
 })
 """
 
@@ -65,7 +80,23 @@ def _clean_title(title):
     return title.strip()
 
 
+# 中文新聞介紹藝人本名的慣用句型：「暱稱」緊接著本名，例如「小宇」宋念宇、
+# 「老蕭」蕭敬騰。只信任這種緊鄰的引號＋姓名組合，而不是「關鍵字出現在摘要
+# 裡任何地方」——後者太寬鬆，會把「文章只是順帶提到這個人名字」的雜訊也
+# 誤判為相關報導（例如某篇報導列舉多位音樂人名字，其中剛好包含搜尋的關鍵字，
+# 但那篇報導其實跟這個人無關）。
+def _has_nickname_intro(text, keyword):
+    return re.search(r'」\s{0,2}' + re.escape(keyword), text) is not None
+
+
 def _filter(links, keyword, url_must_contain, min_len=6):
+    """keyword 可以是單一字串，也可以是多個別名組成的 list（由 app.py 拆解使用者
+    輸入的「宋念宇、小宇」這類多別名字串而來）；符合任一別名即算命中。
+    命中條件：關鍵字出現在標題裡，或標題用了暱稱、但摘要裡有「『暱稱』關鍵字」
+    這種新聞慣用介紹句型（見 `_has_nickname_intro`）。不接受「關鍵字只是出現在
+    摘要某處」這種寬鬆比對，避免把單純提及的雜訊文章也算進來。
+    """
+    keywords = [keyword] if isinstance(keyword, str) else keyword
     seen, results = set(), []
     for it in links:
         href, title = it["href"], it["title"]
@@ -73,7 +104,10 @@ def _filter(links, keyword, url_must_contain, min_len=6):
             continue
         if not any(s in href for s in url_must_contain):
             continue
-        if len(title) < min_len or keyword not in title:
+        if len(title) < min_len:
+            continue
+        context = it.get("context") or ""
+        if not any(k in title or _has_nickname_intro(context, k) for k in keywords):
             continue
         seen.add(href)
         results.append({"title": _clean_title(title), "url": href})
@@ -126,15 +160,36 @@ def _extract_link_title(a):
     return a.get_text(strip=True)
 
 
+_CONTEXT_MAX_LEN = 600
+
+
+def _extract_link_context(a):
+    """往上找最近一層「合理大小」的父層容器文字，當作關鍵字比對用的 context
+    （標題＋摘要），邏輯跟 JS 版 `_EXTRACT_ALL_LINKS` 一致。容器太大（可能是
+    整個版面外層，混進不相關內容）就放棄，回傳 None，讓呼叫端退回只比對標題。
+    """
+    node = a
+    for _ in range(4):
+        parent = node.parent
+        if parent is None or getattr(parent, "name", None) in (None, "[document]", "html", "body"):
+            break
+        text = parent.get_text(" ", strip=True)
+        if len(text) >= 20:
+            return text if len(text) <= _CONTEXT_MAX_LEN else None
+        node = parent
+    return None
+
+
 def _all_links_requests(soup, base_url):
-    """等同於 Playwright 版 `_all_links()`：回傳 list of {"title", "href"} dict。"""
+    """等同於 Playwright 版 `_all_links()`：回傳 list of {"title", "href", "context"} dict。"""
     if soup is None:
         return []
     links = []
     for a in soup.find_all("a", href=True):
         href = urljoin(base_url, a["href"])
         title = _extract_link_title(a)
-        links.append({"title": title, "href": href})
+        context = _extract_link_context(a)
+        links.append({"title": title, "href": href, "context": context})
     return links
 
 
