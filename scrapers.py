@@ -1346,6 +1346,25 @@ def search_setn(page, keyword, start_date, end_date, press_release_text=None):
     請求，且最終報告會出現重複項目），所以這裡先把 href 正規化成只保留
     `NewsID=` 數字（不帶 `From=Search&Key=...` 這些搜尋來源追蹤參數）再交給
     `_candidate_filter()` 去重。
+
+    重要修正（2026-07-05 實測發現的錯誤日期案例）：setn 的搜尋結果「不是」按日期
+    排序，常見關鍵字（例如藝人暱稱「小宇」）一次可能回傳 70~80 篇候選，橫跨
+    2016~2025 年，但 `_verify_candidates()` 只會逐篇造訪驗證前 `_CONTENT_VERIFY_MAX_CANDIDATES`
+    （20）篇、超過的一律進 overflow 桶，而 overflow 桶「不會」擷取文章真正發布日期
+    （見 `_verify_candidates()` 說明），只憑列表頁標題/摘要關鍵字比對就放行、標記
+    `date=None`——等於完全沒有日期過濾，導致大量真正的舊聞（例如 2021 年的報導）
+    被當成命中結果顯示，即使使用者搜尋的日期區間只有一天。
+
+    修法：比照 `search_cts()`／`search_pchome()`／`search_videoland()` 既有的「用
+    可信的輕量日期訊號提早過濾範圍外候選，不佔驗證額度」精神——這裡沒有 API
+    可用，但實測發現每張搜尋結果卡片的縮圖網址本身就內嵌日期路徑（例如
+    `https://attach.setn.com/newsimages/2025/08/05/5218718-L.jpg`），且這個日期
+    跟文章頁 `article:published_time` 實測完全一致（見開發時的驗證腳本）。因此
+    額外查詢每張卡片的 `<img>`，用 NewsID 對應到縮圖日期，範圍外的候選直接不
+    加入 `links`（不是丟給 `_verify_candidates()` 再被 overflow 放行），這樣真正
+    需要驗證的候選數量會大幅縮減到真的在範圍附近的文章，不會被 79 篇裡的其他
+    76 篇舊聞擠出驗證額度。少數抓不到縮圖日期的卡片（理論上不應該發生，防禦性
+    保留）維持原樣交給 `_verify_candidates()`，不主動排除。
     """
     kw = quote(keyword)
     page.goto("https://www.setn.com/", timeout=20000, wait_until="load")
@@ -1364,11 +1383,41 @@ def search_setn(page, keyword, start_date, end_date, press_release_text=None):
         items = page.eval_on_selector_all("div.contLeft a", _EXTRACT_ALL_LINKS)
     except Exception:
         items = []
+    try:
+        img_items = page.eval_on_selector_all(
+            "div.contLeft div[class*='newsimg-area-item']",
+            """els => els.map(e => {
+                const a = e.querySelector('a[href*="NewsID="]');
+                const img = e.querySelector('img');
+                return {
+                    href: a ? a.href : null,
+                    src: img ? (img.getAttribute('data-original') || img.getAttribute('src') || '') : ''
+                };
+            })""",
+        )
+    except Exception:
+        img_items = []
+    date_by_newsid = {}
+    for it in img_items:
+        href, src = it.get("href"), it.get("src") or ""
+        if not href:
+            continue
+        nm = re.search(r'NewsID=(\d+)', href)
+        dm = re.search(r'newsimages/(\d{4})/(\d{2})/(\d{2})', src)
+        if nm and dm:
+            try:
+                date_by_newsid[nm.group(1)] = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
+            except ValueError:
+                pass
     links = []
     for it in items:
         href = it["href"]
         m = re.search(r'NewsID=(\d+)', href)
-        norm_href = f"https://www.setn.com/News.aspx?NewsID={m.group(1)}" if m else href
+        news_id = m.group(1) if m else None
+        norm_href = f"https://www.setn.com/News.aspx?NewsID={news_id}" if news_id else href
+        thumb_date = date_by_newsid.get(news_id) if news_id else None
+        if thumb_date is not None and not (start_date <= thumb_date <= end_date):
+            continue  # 縮圖日期已可信地確認範圍外，提早排除，不佔驗證額度（同 search_cts）
         links.append({"title": it["title"], "href": norm_href, "context": it.get("context")})
     candidates = _candidate_filter(links, ["setn.com/News.aspx"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
