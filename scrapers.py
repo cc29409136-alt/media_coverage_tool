@@ -939,6 +939,441 @@ def search_starsetn(page, keyword, start_date, end_date, press_release_text=None
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
 
+def search_videoland(page, keyword, start_date, end_date, press_release_text=None):
+    """緯來新聞網 news.videoland.com.tw。已改用 requests（純 JSON API＋一個固定的
+    轉址網址模板，不需要 BeautifulSoup 解析列表頁，也不需要 Playwright）。
+    page 參數保留但不使用。
+
+    先前記錄「找到內部 JSON API `newsapi.videoland.com.tw/api/Search`，但無法把
+    結果映射到真正的文章網址」——這裡把整個發現過程重跑一遍：
+
+    1. 這個 API 其實是 **POST**，不是 GET（純 GET 呼叫會得到 405 Method Not
+       Allowed）。實際 request body 是 `application/x-www-form-urlencoded`：
+       `keywords=<urlencoded>&pagecount=10&pageindex=0`（用 Playwright 監看搜尋頁
+       實際送出的 XHR 才抓到這個格式，純看 API 網址猜不出來）。
+    2. 回應 JSON 是一個 list，每筆有 `sno`（文章代碼）、`title`、`newsdesc`
+       （摘要）、`realdate`（`YYYY/MM/DD`，可信的發布日期）——但**沒有任何 URL
+       欄位**，這是先前卡關的原因：以為 `sno` 可以直接拼進某個 URL pattern，
+       實測全部猜測（`/article/<sno>`、`/article/<sno>.html`、`/news/<sno>`、
+       `newsapi.../api/News/<sno>`...）都不是真正的文章頁（有些回 200 但內容是
+       空殼 SPA shell，不是真正文章）。
+    3. 真正的映射關係要從「使用者實際點擊搜尋結果卡片後去了哪裡」反推：這個
+       網站是 React SPA，卡片本身不是 `<a href>`（`_all_links_requests()`／
+       `_all_links()` 完全抓不到），點擊會呼叫 `window.open(url)`。用
+       `page.evaluate("window.open = (url) => window.__capturedUrl = url")`
+       攔截這個呼叫（不讓它真的開新分頁，只記錄參數），點擊後讀出
+       `window.__capturedUrl`，拿到的是 `/viewnews.aspx?sno=<sno>`——一個
+       ASP.NET 網址，伺服器端會 302 轉址到真正的 SPA 文章網址
+       （`/article/<uuid>.html`，跟 API 回傳的 `sno` 完全不同的識別碼）。
+       這一步是關鍵：`sno` 本身不是拼網址用的，而是要先組成
+       `viewnews.aspx?sno=<sno>` 這個「舊版轉址橋接」網址，再讓伺服器端 302
+       轉過去，中間完全不需要瀏覽器執行 JS（`requests.get(..., allow_redirects=True)`
+       預設就會自動跟隨這個 302，`_verify_candidates()` 內部的
+       `_fetch_article_content_and_date()` 用的也是 `requests.get()`，同樣能
+       正確跟隨轉址取得真正文章內容）。
+
+    這裡選擇直接把 `viewnews.aspx?sno=` 網址交給 `_candidate_filter()`／
+    `_verify_candidates()`（而不是先自己解析出轉址後的真正網址），因為
+    `_verify_candidates()` 本來就會對每個候選網址發一次 requests 造訪＋跟隨
+    轉址，沒有必要多一輪「先解析出最終網址」的步驟——`_fetch_article_content_and_date()`
+    目前沒有把轉址後的 `resp.url` 回傳出來，所以候選字典裡存的 `url` 欄位
+    仍然是轉址前的 `viewnews.aspx?sno=` 網址，但這完全沒問題：跟其他站台
+    一樣直接可以點擊使用，使用者點擊時瀏覽器一樣會自動跟著 302 過去真正的
+    文章頁，不影響使用者體驗。
+    """
+    kw = quote(keyword)
+    body = f"keywords={kw}&pagecount=20&pageindex=0"
+    headers = dict(_REQUEST_HEADERS)
+    headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
+    headers["Referer"] = "https://news.videoland.com.tw/"
+    try:
+        resp = requests.post(
+            "https://newsapi.videoland.com.tw/api/Search", headers=headers, data=body, timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return []
+    links = []
+    for item in data if isinstance(data, list) else []:
+        title = (item.get("title") or "").strip()
+        sno = item.get("sno")
+        if not title or not sno:
+            continue
+        pub_d = _parse_date_string(item.get("realdate"))
+        if pub_d is not None and not (start_date <= pub_d <= end_date):
+            continue  # API 已給可信日期，範圍外提早排除，不佔驗證額度（同 search_cts）
+        href = f"https://news.videoland.com.tw/viewnews.aspx?sno={sno}"
+        links.append({"title": title, "href": href, "context": item.get("newsdesc") or title})
+    candidates = _candidate_filter(links, ["news.videoland.com.tw/viewnews.aspx"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+def search_taisounds(page, keyword, start_date, end_date, press_release_text=None):
+    """太報 taisounds.com。已改用 requests + BeautifulSoup（伺服器端渲染）。
+    page 參數保留但不使用。
+
+    先前記錄「Next.js SPA，找不到可用搜尋路由」——實測首頁完全沒有
+    `<script id="__NEXT_DATA__">`，判斷不是 Next.js（可能是 Vue／其他框架，
+    或先前的判斷本身就有誤，這裡不深究框架種類，只確認「不需要當成 Next.js
+    的 `/_next/data/...json` 模式處理」）。
+
+    真正的搜尋 UI 藏在首頁一個預設 `display:none` 的 Bootstrap modal
+    （`#myModal2`）裡：搜尋輸入框 `#keyword` 與搜尋按鈕 `#btnSearch` 都在這個
+    modal 內，必須先點擊 `<a class="ico01" data-toggle="modal"
+    data-target="#myModal2">`（放大鏡圖示，沒有文字/aria-label，純靠
+    `data-target` 屬性找到）才會讓 modal 顯示、輸入框變成可互動狀態——直接對
+    `#keyword` 呼叫 `page.fill()` 會因為元素還是 `display:none` 而逾時卡住。
+
+    點擊搜尋按鈕後，實際導航到 `https://www.taisounds.com/lookfor/tag/<urlencoded>`
+    ——這是一個純伺服器端渲染的「標籤頁」（不是 AJAX API），`requests.get()` 直接
+    呼叫就能拿到跟瀏覽器一致的完整 HTML（已實測「蕭敬騰」關鍵字在頁面中出現
+    數十次，不只在少數幾筆真正相關的候選裡）。
+
+    這個頁面本質上是「標籤聚合頁」，且實測發現一個跟其他站台不一樣的重要地雷：
+    最前面 20 篇幾乎都是跟關鍵字完全不相關的「網站最新新聞」（這個標籤頁把
+    「符合標籤的文章」跟「全站最新」混在同一個列表裡呈現，不是嚴格由新到舊
+    排序的關鍵字搜尋結果），真正符合關鍵字的候選反而排在第 20 筆之後——這正好
+    卡進 `_CONTENT_VERIFY_MAX_CANDIDATES=20` 的驗證額度之外，導致實測第一版
+    直接照抄其他站台的寫法時，全部命中的候選都落入 overflow 桶、日期一律
+    `date=None`（不是抓不到日期，文章頁日期其實抓得到，見
+    `_fetch_article_content_and_date` 的獨立測試；純粹是候選順序問題）。
+
+    修法：拿到候選列表後，先依「標題是否包含關鍵字」重新排序（標題命中的排到
+    前面），再交給 `_candidate_filter()`／`_verify_candidates()`。這不算繞過
+    「造訪文章本頁驗證內容」的原則——每篇候選還是一樣會被 `_verify_candidates()`
+    造訪本頁驗證，這裡只是調整「哪 20 篇優先拿到驗證名額」的順序，跟
+    `search_cts()`／`search_videoland()` 用 API 日期做預先過濾是同樣的精神
+    （避免明顯不相關或排序考量的候選白白占用驗證額度），只是這裡沒有 API
+    日期可用，改用「標題關鍵字」這個更陽春但一樣可靠的訊號。
+    """
+    kw = quote(keyword)
+    url = f"https://www.taisounds.com/lookfor/tag/{kw}"
+    soup = _get_soup(url)
+    links = _all_links_requests(soup, url)
+    candidates = _candidate_filter(links, ["taisounds.com/news/content/"])
+    candidates.sort(key=lambda c: 0 if keyword in c["title"] else 1)
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+_ENEWS_CSE_CX = "c2e4ab61825ba4815"  # 從 enews.tw 首頁 `gcse.js?cx=...` 嵌入碼取得的 CSE ID
+
+
+def search_enews(page, keyword, start_date, end_date, press_release_text=None):
+    """eNEWS enews.tw。維持 Playwright：站內原生搜尋頁（`/search?keyword=`）
+    重新檢查過一次，確認仍是先前記錄的狀態——頁面本身沒有串接真正的搜尋功能，
+    只嵌入一個 Google 自訂搜尋（CSE）小工具（`<div class="gcse-searchbox-only">`
+    ＋ `<script src="https://cse.google.com/cse.js?cx=c2e4ab61825ba4815">`），
+    首頁本身這個搜尋框只是導向 CSE，不是自建的搜尋結果頁。
+
+    這裡採用跟 `hitfm`（見 config.py／app.py 的手動連結清單）同樣的技巧，但比
+    hitfm 更進一步：直接嘗試 CSE 提供的免費、免 API 金鑰的網頁版結果頁
+    `https://cse.google.com/cse?cx=<cx>&q=<kw>`。純 `requests.get()` 這個網址
+    只會拿到一個等待 JS 執行的空殼（`<div id="cse-hosted">`，實際結果由內嵌的
+    `cse.js` 動態 XHR 載入 `https://cse.google.com/cse/element/v1?...&cse_tok=...`
+    這個端點才會拿到，而且這個端點需要一個跟瀏覽器 session／頁面載入綁定的
+    `cse_tok` 簽章參數，纯 `requests` 沒有這個 token 直接呼叫會被 Google 判定為
+    自動化查詢、回傳 403"Sorry..."頁——這點證實了 hitfm 註解裡「需要瀏覽器執行
+    JS 才能通過」的判斷，純 requests 這條路線走不通）。
+
+    但用 Playwright 完整載入 `cse.google.com/cse?cx=...&q=...` 這個頁面（讓
+    `cse.js` 自己完成 token 簽章＋XHR 請求＋把結果渲染進 DOM）之後，
+    `a.gs-title` 選擇器就能抓到乾淨的搜尋結果（標題＋原始網站的真正文章網址，
+    例如 `enews.tw/article/1263176`）——這個技巧比直接呼叫內部 XHR 端點更簡單
+    可靠（不用自己處理 token 簽章），且因為 CSE 頁面本身跟 enews.tw 沒有網域
+    綁定關係，這個函式其實可以直接複用同一套手法處理 hitfm（差別只在
+    `cx` 參數），但 hitfm 目前仍先維持手動——本次時間分配優先把這個技巧
+    在 enews 驗證過一輪，hitfm 的 `cx` 尚待從其官網嵌入碼確認。
+    """
+    kw = quote(keyword)
+    url = f"https://cse.google.com/cse?cx={_ENEWS_CSE_CX}&q={kw}"
+    page.goto(url, timeout=25000, wait_until="load")
+    page.wait_for_timeout(3500)
+    try:
+        items = page.eval_on_selector_all(
+            "a.gs-title",
+            "els => els.map(e => ({title: e.textContent.trim(), href: e.href}))",
+        )
+    except Exception:
+        items = []
+    links = [{"title": it["title"], "href": it["href"], "context": it["title"]} for it in items if it["title"]]
+    candidates = _candidate_filter(links, ["enews.tw/article/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+def search_yam(page, keyword, start_date, end_date, press_release_text=None):
+    """蕃薯藤 n.yam.com（清單裡的「蕃新聞」是同一個網站，見 config.py 註解）。
+    已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+
+    首頁 `#skeyword` input 對應的 `<form action="https://n.yam.com/Home/keywordSearch"
+    method="post">`：實測發現直接照抄「表單填字＋按 Enter／點搜尋按鈕」在 Playwright
+    裡完全沒有觸發任何導航（GA 只記錄到一個 `form_start` 事件，之後沒有下文，猜測
+    前端另外綁了會攔截預設送出行為的 JS，但沒深究到底為什麼失敗）。改用更簡單的
+    路線：直接對同一個 action 網址發 **GET**（不是表單宣告的 POST）並帶
+    `?keyword=<urlencoded>` query string，伺服器端會 302 轉址到真正的搜尋結果頁
+    `https://search.yam.com/Search/news?q=<urlencoded>`——這一步是關鍵發現，之前的
+    嘗試卡在「以為要照表單的 POST 方式送出」，但其實 GET＋轉址就會直接到對的地方，
+    且這個轉址是伺服器端 302（`requests` 預設 `allow_redirects=True` 就會自動跟過去），
+    不需要瀏覽器執行 JS。`search.yam.com` 這個結果頁本身也是伺服器端渲染，直接用
+    `requests` 拿到的 HTML 就含有完整搜尋結果（已實測「蕭敬騰」關鍵字在 HTML
+    中出現數十次，不是只在 meta 標籤）。
+    """
+    kw = quote(keyword)
+    url = f"https://n.yam.com/Home/keywordSearch?keyword={kw}"
+    soup = _get_soup(url)
+    links = _all_links_requests(soup, url)
+    candidates = _candidate_filter(links, ["n.yam.com/Article/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+def search_linetoday(page, keyword, start_date, end_date, press_release_text=None):
+    """LINE TODAY。不需要 Playwright，純 `requests` 呼叫內部 JSON API 即可。
+    page 參數保留但不使用。
+
+    首頁／`?q=` 這種直接帶 query string navigate 的方式不會觸發真正的搜尋（純 JS
+    路由，`?q=` 只是預填欄位用，實測 `.searchBar-input` 的 value 是空的，也沒有
+    對應的搜尋 XHR 被送出）。照這個模組其他站台的做法，改用 Playwright 實際
+    操作搜尋 UI（點擊輸入框、打字、按 Enter），透過 `page.on("response")` 監看
+    網路請求，找到真正被前端呼叫的搜尋端點：
+    `https://today.line.me/webapi/listing/search?country=tw&query=<urlencoded>`。
+
+    找到端點後，實測發現這個 JSON API 本身**完全不需要瀏覽器**：純 `requests.get()`
+    不帶任何特殊 header（連 Referer 都不用）就能拿到跟瀏覽器一樣的 200 JSON
+    回應，因此這裡整個函式改成 API 直連，不需要啟動 headless Chromium（也不用
+    加進 `PLAYWRIGHT_REQUIRED_SITES`）。
+
+    回應是 `{"items": [...], "lastUpdatedTime": ...}`，單次呼叫就回傳最多 200 筆
+    （已實測涵蓋數個月的範圍，不需要分頁），每筆結構：
+    - `title`：標題（跟其他站台一樣，這是「關鍵字相關」排序，不是嚴格子字串比對，
+      例如搜尋「蕭敬騰」，第一筆可能是完全不相關的《VPOP ASIA》報導，靠
+      `_verify_candidates()` 的標題／內容關鍵字比對負責篩掉這些雜訊）。
+    - `publishTimeUnix`：毫秒 epoch timestamp，已實測換算成台灣時區日期跟文章本頁
+      擷取到的日期一致，這裡沿用跟 `search_cts()` 一樣的「API 已經給可信日期，
+      先做範圍預先過濾，避免不可靠的候選占用 `_verify_candidates()` 的驗證額度」
+      做法（LINE TODAY 的 200 筆結果不是嚴格按日期排序，用 pagination 提早停止
+      的技巧在這裡不適用，只能全部先用 API 日期篩過一輪）。
+    - `url.hash`：文章網址的識別碼，真正網址是
+      `https://today.line.me/tw/v3/article/<hash>`（已實測跟 Playwright 操作 UI
+      後在 DOM 裡看到的 `<a href>` 完全一致），這個網址本身也是伺服器端渲染，
+      `_verify_candidates()` 內部用 plain requests 造訪即可正常取得內容與日期。
+    - `publisher`：這則報導的原始來源媒體名稱（LINE TODAY 本身是轉載聚合平台），
+      這裡沒有特別處理來源標註，維持跟其他轉載平台（Yahoo、Google新聞）一致的
+      呈現方式，不特別在標題加註來源。
+    """
+    kw = quote(keyword)
+    url = f"https://today.line.me/webapi/listing/search?country=tw&query={kw}"
+    try:
+        resp = requests.get(url, headers=_REQUEST_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return []
+    links = []
+    for item in data.get("items") or []:
+        title = (item.get("title") or "").strip()
+        url_hash = (item.get("url") or {}).get("hash")
+        if not title or not url_hash:
+            continue
+        ts = item.get("publishTimeUnix")
+        pub_d = None
+        if isinstance(ts, (int, float)):
+            try:
+                pub_d = datetime.fromtimestamp(ts / 1000).date()
+            except (ValueError, OverflowError, OSError):
+                pub_d = None
+        if pub_d is not None and not (start_date <= pub_d <= end_date):
+            continue  # API 已給可信日期，範圍外提早排除，不佔驗證額度（同 search_cts）
+        href = f"https://today.line.me/tw/v3/article/{url_hash}"
+        links.append({"title": title, "href": href, "context": item.get("shortDescription") or title})
+    candidates = _candidate_filter(links, ["today.line.me/tw/v3/article/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+_PCHOME_SEARCH_MAX_PAGES = 10  # 效能考量：最多翻幾頁（每頁 12 筆），一旦整頁都比 start_date 早就提早停止
+
+
+def search_pchome(page, keyword, start_date, end_date, press_release_text=None):
+    """PChome新聞。已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+
+    先前記錄「首頁 timeout / 很慢」——實測今天首頁與搜尋頁都在 1-2 秒內回應，
+    未重現逾時，可能是網站狀況已經改善，也可能單純是當時網路環境問題；這裡還是
+    保守把 timeout 拉高到 30 秒（見 `_get_soup(url, timeout=30)`）以防偶發變慢。
+
+    搜尋結果頁 `https://news.pchome.com.tw/search/<kw>` 本身是伺服器端渲染，
+    每篇搜尋結果包在 `class="channel_newssection"` 的 `<div>` 裡（共用的
+    `_all_links_requests()` 掃全頁 `<a>` 會連同側欄「HOT人氣新聞」跟頁首導覽列
+    都一起抓進來，所以這裡不用共用的全頁掃描，改成先鎖定 `channel_newssection`
+    容器，只在容器內找主要文章連結，並排除容器內「關駉字：」標籤列的
+    `/keyword/` 連結——那些指向站內關鍵字聚合頁，不是文章）。
+
+    分頁：路徑加數字（`/search/<kw>/2`、`/search/<kw>/3`...）才是真正翻頁，
+    `?page=2` 這種 query string 會被忽略、直接回傳第 1 頁（實測確認）。結果依日期
+    新到舊排序，且文章網址本身就含 `YYYYMMDD`（例如
+    `.../20260702/index-....html`），可以用這個路徑日期做兩件事：(1) 交給
+    `_candidate_filter()`／`_verify_candidates()` 之前先過濾掉日期已經早於
+    `start_date` 的候選（跟 `search_cts()` 同樣的預先過濾精神，避免占用驗證額度）；
+    (2) 一旦整頁 12 筆都早於 `start_date`，代表後面的頁面只會更舊，提早停止翻頁
+    （不像 cts 的 API 排序混亂無法這樣做，pchome 這裡是真的嚴格新到舊排序，可以
+    安全提早結束）。
+    """
+    kw = quote(keyword)
+    links = []
+    for pg in range(1, _PCHOME_SEARCH_MAX_PAGES + 1):
+        url = f"https://news.pchome.com.tw/search/{kw}" if pg == 1 else f"https://news.pchome.com.tw/search/{kw}/{pg}"
+        soup = _get_soup(url, timeout=30)
+        sections = soup.find_all(class_="channel_newssection") if soup else []
+        if not sections:
+            break
+        page_has_in_range = False
+        for sec in sections:
+            main_a = sec.find("a", attrs={"data-linkdef": True})
+            if not main_a or not main_a.get("href"):
+                continue
+            href = main_a["href"]
+            title = (main_a.get("title") or main_a.get_text(strip=True) or "").strip()
+            if not title:
+                continue
+            m = re.search(r'/(20\d{6})/', href)
+            url_date = None
+            if m:
+                s = m.group(1)
+                try:
+                    url_date = date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+                except ValueError:
+                    url_date = None
+            if url_date is not None:
+                if url_date < start_date:
+                    continue  # 太舊，跳過（不佔驗證額度），但仍可能同頁有更新的項目排在前面
+                if url_date <= end_date:
+                    page_has_in_range = True
+            links.append({"title": title, "href": href, "context": sec.get_text(" ", strip=True)[:_CONTEXT_MAX_LEN]})
+        if not page_has_in_range:
+            break  # 這一整頁都早於 start_date（或抓不到日期但已無新項目），後面只會更舊
+    candidates = _candidate_filter(links, ["news.pchome.com.tw/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+_CTS_SEARCH_MAX_PAGES = 3  # 效能考量：最多翻幾頁 API（每頁約 29-30 筆），足以涵蓋近期搜尋範圍
+
+
+def search_cts(page, keyword, start_date, end_date, press_release_text=None):
+    """華視 news.cts.com.tw。已改用 requests（純 JSON API，連 BeautifulSoup 都不需要）。
+    page 參數保留但不使用。
+
+    首頁沒有任何 `<form>`／搜尋連結可循（實測 Playwright 掃描 `<input>`／`<form>`
+    元素都是空陣列），但 `robots.txt` 裡的 `Disallow: /search` 暗示這個路徑其實存在
+    （只是不希望被搜尋引擎收錄），純 `requests.get("/search/?q=...")` 直接拿到 500
+    錯誤頁——這是 Vue SPA 的路由（頁面 CSS 可見 `news-search-overlay`／
+    `news-search-dialog` 這類 scoped class name），伺服器端直接渲染這個路由本身不成立，
+    500 是預期中的行為，不是網站掛了。
+
+    真正的做法：用 Playwright 點擊首頁上 `aria-label="開啟搜尋"` 的按鈕開啟搜尋
+    對話框，輸入關鍵字送出後，監看瀏覽器發出的 XHR/fetch 請求，找到前端呼叫的
+    API 端點：`https://news.cts.com.tw/api/searches/news?keyword=<urlencoded>&page=<n>`。
+    這個端點回傳乾淨的 JSON（`{"data": {"news": [...], "total":, "pagination":}}`，
+    每筆已含 `title`／`publishTime`（`YYYY-MM-DD HH:MM:SS`，可直接當作候選的日期，
+    但仍然照既有慣例交給 `_verify_candidates()` 造訪文章本頁做內容驗證＋日期
+    二次確認，不直接信任列表 API 回傳的日期／標題）／`link`（文章網址）——且這個
+    JSON API 本身可以直接用 `requests` 呼叫，完全不需要啟動瀏覽器（Playwright
+    只是用來「發現」這個 API 端點的偵錯手段，找到之後就不必再依賴它）。
+
+    翻頁與日期範圍：API 回傳結果不是嚴格按日期排序（實測 page=1 最後幾筆已經是數個
+    月前的報導，page=2 開頭卻跳到 2024/2020 年的舊聞），這點如果照其他站台的既有
+    寫法（直接把所有候選丟給 `_candidate_filter()`／`_verify_candidates()`，靠後者
+    `_CONTENT_VERIFY_MAX_CANDIDATES` 上限只驗證前 20 筆、其餘 overflow 候選一律
+    `date=None` 不篩日期）會出大問題：因為排序是亂的，「其餘」不是「比較舊、大概
+    率不重要」的候選，可能一堆是舊聞卻因為 overflow 邏輯直接以 date=None 全部通過
+    標題比對顯示出來（實測若不做這裡的預先過濾，65 筆結果裡有 64 筆 date=None，
+    include 一堆 2024/2025 年的舊聞）。這裡的 API 剛好本來就在列表階段直接給
+    `publishTime`（真實發布時間，不是像其他站台列表頁那樣不可靠的相對時間字串），
+    所以在丟給共用驗證流程之前，先用這個日期做一次陽春的範圍過濾——不算是繞過
+    「造訪文章本頁驗證內容」這個核心原則（關鍵字／暱稱鄰接／新聞稿相似度比對
+    仍然全部交給 `_verify_candidates()` 對文章本頁做，這裡只是先篩掉日期一看就
+    確定不在範圍內的候選，避免它們占用 20 筆的驗證額度、把真正在範圍內但排序
+    較後面的候選擠到 overflow 桶去）。
+    """
+    kw = quote(keyword)
+    links = []
+    for pg in range(1, _CTS_SEARCH_MAX_PAGES + 1):
+        url = f"https://news.cts.com.tw/api/searches/news?keyword={kw}&page={pg}"
+        try:
+            resp = requests.get(url, headers=_REQUEST_HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError):
+            break
+        news_items = (data.get("data") or {}).get("news") or []
+        if not news_items:
+            break
+        for item in news_items:
+            title = (item.get("title") or "").strip()
+            link = item.get("link") or ""
+            if not title or not link:
+                continue
+            pub_d = _parse_date_string(item.get("publishTime"))
+            if pub_d is not None and not (start_date <= pub_d <= end_date):
+                continue  # API 本身就給了可信日期，範圍外的候選提早排除，不占驗證額度
+            links.append({"title": title, "href": link, "context": title})
+        total_pages = ((data.get("data") or {}).get("pagination") or {}).get("totalPages", 1)
+        if pg >= total_pages:
+            break
+    candidates = _candidate_filter(links, ["news.cts.com.tw/"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
+def search_setn(page, keyword, start_date, end_date, press_release_text=None):
+    """三立新聞網 setn.com（與已支援的子站 star.setn.com「娛樂星聞」為不同網站）。
+
+    維持 Playwright，而且不能只用 `page.goto(url_with_query_string)`：這是 ASP.NET
+    WebForms 頁面（`#keyword` input + `__VIEWSTATE` hidden field + `<form method="post"
+    action="https://www.setn.com/">`），單純用 `?kw=...` 這種 GET query string 直接
+    navigate 到 `search.aspx?kw=...` 只會拿到完全空白的頁面（實測 `requests.get()` 跟
+    Playwright `page.goto()` 都一樣，回應是 200 但 body 幾乎是空的 `<html><head></head>
+    <body></body></html>`，不是 Cloudflare 或其他阻擋，就是這條路由本身不認 query
+    string）。真正可行的方式是複製使用者實際操作：先載入首頁，把關鍵字填進
+    `#keyword`，再按 Enter 觸發表單 postback（`page.expect_navigation()` 等表單送出後
+    的整頁導航完成），瀏覽器導航後網址會變成不帶 query string 的乾淨
+    `search.aspx`，但頁面內容此時才是真正的搜尋結果。
+
+    搜尋結果列在 `div.contLeft` 容器內（其餘同層級的 `sbNewsList`／`owl-item` 等 class
+    是首頁承襲下來的側欄「最新新聞」跑馬燈，不是搜尋結果，必須限定在這個容器內找
+    連結，否則會把無關的首頁頭條當成搜尋結果——這是實測踩到的坑：一開始用共用的
+    `_all_links(page)` 掃全頁面 `<a>`，抓到的全是側欄最新新聞，關鍵字完全對不上）。
+
+    每篇結果在 `div.contLeft` 內固定出現兩個 `<a>`（標題一個、摘要一個），兩者
+    href 都指向同一篇文章，只差在標題連結多了 `&Key=<urlencoded keyword>` 查詢參數
+    ——如果直接拿完整 href 去重，会把同一篇文章當成兩篇不同候選（多打一次驗證
+    請求，且最終報告會出現重複項目），所以這裡先把 href 正規化成只保留
+    `NewsID=` 數字（不帶 `From=Search&Key=...` 這些搜尋來源追蹤參數）再交給
+    `_candidate_filter()` 去重。
+    """
+    kw = quote(keyword)
+    page.goto("https://www.setn.com/", timeout=20000, wait_until="load")
+    page.wait_for_timeout(1500)
+    try:
+        page.fill("#keyword", keyword)
+        # setn.com 掛載大量廣告/分析 script，"load" 事件觸發時間偶爾會拖到 20 秒以上
+        # 才完成（實測驗證時遇過幾次 timeout，重跑就正常），這裡拉高到 30 秒降低
+        # 偶發逾時導致整批漏抓的機率；失敗時仍優雅降級回傳空列表，不影響其他站台。
+        with page.expect_navigation(timeout=30000):
+            page.press("#keyword", "Enter")
+    except Exception:
+        return []
+    page.wait_for_timeout(2000)
+    try:
+        items = page.eval_on_selector_all("div.contLeft a", _EXTRACT_ALL_LINKS)
+    except Exception:
+        items = []
+    links = []
+    for it in items:
+        href = it["href"]
+        m = re.search(r'NewsID=(\d+)', href)
+        norm_href = f"https://www.setn.com/News.aspx?NewsID={m.group(1)}" if m else href
+        links.append({"title": it["title"], "href": norm_href, "context": it.get("context")})
+    candidates = _candidate_filter(links, ["setn.com/News.aspx"])
+    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+
+
 def search_googlenews(page, keyword, start_date, end_date, press_release_text=None):
     """Google 新聞 RSS 搜尋（聚合各媒體報導，不需要 Playwright page）。
     刻意不套用本次新增的「造訪文章本頁驗證」流程（`_verify_candidates()`）：Google News RSS
@@ -1015,6 +1450,14 @@ SEARCH_FUNCS = {
     "insightpost": search_insightpost,
     "starsetn": search_starsetn,
     "googlenews": search_googlenews,
+    "setn": search_setn,
+    "yam": search_yam,
+    "cts": search_cts,
+    "pchome": search_pchome,
+    "linetoday": search_linetoday,
+    "videoland": search_videoland,
+    "taisounds": search_taisounds,
+    "enews": search_enews,
 }
 
 # 仍需要 Playwright（真實瀏覽器執行 JS）才能取得搜尋結果的站台清單。
@@ -1029,4 +1472,6 @@ PLAYWRIGHT_REQUIRED_SITES = {
     "mnews",        # 搜尋結果純前端渲染，requests 抓不到關鍵字
     "owlnews",      # 文章清單由前端 JS 動態載入
     "insightpost",  # 整站為前端 JS SPA
+    "setn",         # ASP.NET WebForms postback，需要真的填表單＋按 Enter 觸發搜尋
+    "enews",        # 依賴 Google 自訂搜尋（CSE）小工具，結果由 cse.js 動態 XHR＋簽章 token 載入，需要真實瀏覽器執行
 }

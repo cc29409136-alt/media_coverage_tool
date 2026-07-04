@@ -10,12 +10,12 @@ SITES = [
     {"key": "ettoday", "name": "ETtoday", "category": "原生媒體", "status": "active"},
     {"key": "udn", "name": "聯合報／噓星聞", "category": "原生媒體", "status": "active"},
     {"key": "mirror", "name": "鏡報", "category": "原生媒體", "status": "active"},
-    {"key": "setn", "name": "三立新聞網", "category": "原生媒體", "status": "manual"},
-    {"key": "yam", "name": "蕃薯藤", "category": "原生媒體", "status": "manual"},
-    {"key": "cts", "name": "華視", "category": "原生媒體", "status": "manual"},
+    {"key": "setn", "name": "三立新聞網", "category": "原生媒體", "status": "active"},
+    {"key": "yam", "name": "蕃薯藤", "category": "原生媒體", "status": "active"},
+    {"key": "cts", "name": "華視", "category": "原生媒體", "status": "active"},
     {"key": "yahoo", "name": "Yahoo奇摩新聞", "category": "轉載平台", "status": "active"},
-    {"key": "pchome", "name": "PChome新聞", "category": "轉載平台", "status": "manual"},
-    {"key": "linetoday", "name": "LINE TODAY", "category": "轉載平台", "status": "manual"},
+    {"key": "pchome", "name": "PChome新聞", "category": "轉載平台", "status": "active"},
+    {"key": "linetoday", "name": "LINE TODAY", "category": "轉載平台", "status": "active"},
 
     # --- 2026 新增媒體 ---
     {"key": "ctwant", "name": "CTWANT", "category": "原生媒體", "status": "active"},
@@ -37,14 +37,14 @@ SITES = [
     {"key": "starsetn", "name": "娛樂星聞", "category": "原生媒體", "status": "active"},
     {"key": "googlenews", "name": "Google新聞", "category": "轉載平台", "status": "active"},  # RSS 聚合搜尋，非單一原生媒體
 
-    {"key": "videoland", "name": "緯來新聞網", "category": "原生媒體", "status": "manual"},  # React SPA，搜尋結果無法從 DOM 取得文章網址（僅找到內部 JSON API）
-    {"key": "taisounds", "name": "太報", "category": "原生媒體", "status": "manual"},  # Next.js SPA，找不到可用搜尋路由
-    {"key": "enews", "name": "eNEWS", "category": "原生媒體", "status": "manual"},  # 搜尋頁為未串接完成的樣板頁（顯示假資料）
-    {"key": "nchn", "name": "全國大小事新聞網", "category": "原生媒體", "status": "manual"},  # Cloudflare 阻擋 headless 瀏覽器（403）
-    {"key": "ecreative", "name": "E創傳媒", "category": "原生媒體", "status": "manual"},  # Cloudflare 阻擋 headless 瀏覽器（403）
-    {"key": "bigtimes", "name": "大時事", "category": "原生媒體", "status": "manual"},  # Cloudflare 阻擋 headless 瀏覽器（403）
-    {"key": "businessalert", "name": "商訊快報", "category": "原生媒體", "status": "manual"},  # Cloudflare 阻擋 headless 瀏覽器（403）
-    {"key": "hitfm", "name": "HitFM", "category": "原生媒體", "status": "manual"},  # 搜尋為 Google 自訂搜尋（CSE），非站內原生搜尋
+    {"key": "videoland", "name": "緯來新聞網", "category": "原生媒體", "status": "active"},
+    {"key": "taisounds", "name": "太報", "category": "原生媒體", "status": "active"},
+    {"key": "enews", "name": "eNEWS", "category": "原生媒體", "status": "active"},
+    {"key": "nchn", "name": "全國大小事新聞網", "category": "原生媒體", "status": "manual"},  # Cloudflare Turnstile 互動式挑戰（非單純 JS cookie 驗證），headless Chromium 仍卡在「請稍候...」頁面，需人工解謎，非付費/自動化可解
+    {"key": "ecreative", "name": "E創傳媒", "category": "原生媒體", "status": "manual"},  # 同上，Cloudflare Turnstile 互動式挑戰，headless 瀏覽器也無法自動通過
+    {"key": "bigtimes", "name": "大時事", "category": "原生媒體", "status": "manual"},  # 同上，Cloudflare Turnstile 互動式挑戰，headless 瀏覽器也無法自動通過
+    {"key": "businessalert", "name": "商訊快報", "category": "原生媒體", "status": "manual"},  # 同上，Cloudflare Turnstile 互動式挑戰，headless 瀏覽器也無法自動通過
+    {"key": "hitfm", "name": "HitFM", "category": "原生媒體", "status": "manual"},  # 重新查證：首頁搜尋框其實是「曲目查詢」用途、非新聞搜尋，且站內找不到 Google CSE 嵌入碼（cse.js/gcse），新聞頁 hitonews.php 也無搜尋功能，只能手動瀏覽
     {"key": "yololab", "name": "YOLO LAB01", "category": "原生媒體", "status": "manual"},  # 科技媒體觀察評論網站，無站內搜尋功能
     {"key": "wownews", "name": "WoWoNews", "category": "原生媒體", "status": "manual"},  # 官網網域已失效，現況導向 Facebook 粉專
     {"key": "chasestar", "name": "一起追星去", "category": "原生媒體", "status": "manual"},  # 疑似僅有粉專無獨立網站

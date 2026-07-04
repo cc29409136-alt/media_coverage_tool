@@ -104,11 +104,12 @@ with st.container(border=True):
             )
 
         press_release = st.text_area(
-            "新聞稿全文（選填，貼上後會用來比對文章內容相似度，提高比對準確率）",
+            "新聞稿全文或大綱（選填，貼上後會用來比對文章內容相似度，提高比對準確率）",
             height=120,
-            help="貼上完整新聞稿全文（建議 30 字以上才會生效）：系統會拿候選文章的內容"
-                 "跟新聞稿比對相似度，用來排除「有提到關鍵字但其實是別的新聞」的誤判，"
-                 "並抓出用詞改寫但確實是同一則新聞的報導。留空則沿用原本只看關鍵字的比對方式。",
+            help="貼上新聞稿全文，或只貼幾句話的大綱／關鍵詞也可以，沒有字數限制："
+                 "系統會拿候選文章的內容跟你貼的內容比對相似度，用來排除「有提到關鍵字"
+                 "但其實是別的新聞」的誤判，並抓出用詞改寫但確實是同一則新聞的報導。"
+                 "內容越完整，比對會越準；留空則沿用原本只看關鍵字的比對方式。",
         )
         submitted = st.form_submit_button("🔍 開始搜尋", use_container_width=True, type="primary")
 
@@ -281,14 +282,6 @@ if "search_results" in st.session_state:
     with st.expander("⚠️ 以下媒體尚未支援自動搜尋，需要手動確認"):
         for site in MANUAL_SITES:
             manual_url = {
-                "setn": f"https://www.setn.com/search.aspx?kw={quote(keyword)}",
-                "yam": f"https://n.yam.com/",
-                "cts": f"https://news.cts.com.tw/",
-                "pchome": f"https://news.pchome.com.tw/",
-                "linetoday": f"https://today.line.me/tw/v3/search?q={quote(keyword)}",
-                "videoland": f"https://news.videoland.com.tw/search?q={quote(keyword)}",
-                "taisounds": "https://www.taisounds.com/",
-                "enews": f"https://enews.tw/search?keyword={quote(keyword)}",
                 "nchn": f"https://nchn.news/?s={quote(keyword)}",
                 "ecreative": f"https://e-creative.media/?s={quote(keyword)}",
                 "bigtimes": f"https://bigtimes.net/?s={quote(keyword)}",
