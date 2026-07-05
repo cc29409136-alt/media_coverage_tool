@@ -515,11 +515,43 @@ def _candidate_filter(links, url_must_contain, min_len=6):
     return results
 
 
+# 2026-07-05 新增：標題裡關鍵字「只是被提到所屬公司/團隊」的所有格用法偵測。
+# 背景（實測案例）：搜尋「蕭敬騰」時出現「才說「不想去台灣發展」！艾薇遭控「忘恩
+# 負義」蕭敬騰　公司緊急發聲」這類新聞——文章真正的主角是艾薇（她的爭議發言），
+# 蕭敬騰只是被提到「他的經紀公司」出面回應，本人並未真正被報導。這種情況舊版邏輯
+# 會誤判命中，因為標題比對是「只要關鍵字出現在標題就算數」，完全沒檢查關鍵字在
+# 標題裡扮演的是「文章主角」還是「所有格修飾語」。使用者確認這類新聞不算他要的
+# 媒體露出（明確要求濾掉），所以這裡新增判斷：如果標題裡「每一次」出現關鍵字都
+# 緊接著「公司／經紀公司／旗下／老闆／東家」這類所有格詞（中間可以夾標點符號或
+# 空白，例如「蕭敬騰　公司緊急發聲」的全形空白、「蕭敬騰！經紀公司回應了」的
+# 驚嘆號），就視為「純掛名」、標題比對不算數，改退回檢查內文摘要是否有更實質的
+# 命中證據（如果內文摘要也只是提到公司、或根本沒提到，就正確判定不命中）。
+# 只要有任何一次出現不是這個所有格樣式（代表關鍵字本人才是文章討論的對象，例如
+# 「蕭敬騰認「沒人call我」」），就不算純掛名，標題比對照舊算命中。
+_AFFILIATION_AFTER_RE = re.compile(r'^[的，,、！!？?\s　]{0,3}(經紀公司|公司|旗下|老闆|東家)')
+
+
+def _title_keyword_is_affiliation_only(title, keyword):
+    idx = 0
+    seen_any = False
+    while True:
+        idx = title.find(keyword, idx)
+        if idx == -1:
+            break
+        seen_any = True
+        after = title[idx + len(keyword):]
+        if not _AFFILIATION_AFTER_RE.match(after):
+            return False
+        idx += len(keyword)
+    return seen_any
+
+
 def _content_keyword_match(title, snippet, keywords):
     """文章本頁內容驗證用的關鍵字命中判斷。跟 `_filter()` 的邏輯保持一致的嚴謹標準：
-    標題命中永遠算數（便宜、可信）；內容摘要則同時接受「暱稱緊接本名」的鄰接比對
-    （`_has_nickname_intro`，跟列表頁摘要比對用同一份規則），以及「關鍵字整段直接
-    出現在摘要、且不是逗號/頓號列舉雜訊的一部分」的子字串比對。
+    標題命中原則上算數（便宜、可信），但排除「純掛名所屬公司」的情況（見上方
+    `_title_keyword_is_affiliation_only` 說明）；內容摘要則同時接受「暱稱緊接本名」
+    的鄰接比對（`_has_nickname_intro`，跟列表頁摘要比對用同一份規則），以及「關鍵字
+    整段直接出現在摘要、且不是逗號/頓號/連接詞列舉雜訊的一部分」的子字串比對。
 
     這裡原本想單純用「關鍵字有出現在摘要就算命中」（比列表頁摘要比對更寬鬆一點，
     理由是 og:description／內文前幾段通常是 CMS 寫的完整導言散文，不是「一堆人名
@@ -528,9 +560,11 @@ def _content_keyword_match(title, snippet, keywords):
     蕭敬騰等大咖音樂人現場演出...」，關鍵字前面剛好是「、」，証明列舉雜訊一樣會
     出現在文章導言裡，不是只有列表頁的「相關文章」推薦區塊才有。所以子字串比對
     這裡加一道跟 `_has_nickname_intro` 同精神的列舉分隔符號防呆：只要關鍵字緊鄰
-    （前一個字或後一個字）逗號/頓號，就視為列舉雜訊、不算單純子字串命中（但仍可能
-    透過 `_has_nickname_intro` 命中，只是這裡故意更嚴格一點，避免走回頭路重現
-    今天稍早修過的「蕭敬騰／羅大佑」誤判）。
+    前一個字是逗號/頓號、或後面緊接著逗號/頓號/與/和/跟/及這類連接詞（沿用
+    `_LIST_SEPARATOR_AFTER_RE`，跟 `_has_nickname_intro` 用同一份規則，修正舊版
+    子字串比對這裡漏檢查連接詞、只檢查逗號頓號的不一致——實測「蕭敬騰及經紀人
+    Summer」這類用「及」而非頓號列舉的案例，舊版子字串比對會漏放行），就視為
+    列舉雜訊、不算單純子字串命中。
 
     這個函式本身「不」處理新聞稿相似度——那是額外的獨立信號，由呼叫端
     `_verify_candidates()` 在拿到這裡的布林結果之後，再視情況合併新聞稿相似度分數
@@ -538,7 +572,7 @@ def _content_keyword_match(title, snippet, keywords):
     職責切分，方便沒有貼新聞稿的情境可以單獨呼叫這裡、行為完全不變。
     """
     for k in keywords:
-        if k in title:
+        if k in title and not _title_keyword_is_affiliation_only(title, k):
             return True
         if not snippet:
             continue
@@ -549,9 +583,9 @@ def _content_keyword_match(title, snippet, keywords):
             continue
         before = snippet[idx - 1] if idx > 0 else ""
         after_idx = idx + len(k)
-        after = snippet[after_idx] if after_idx < len(snippet) else ""
-        if before in "，,、" or after in "，,、":
-            continue  # 列舉雜訊（例如「詹雯婷、羅大佑、蕭敬騰等」），不算命中
+        after_ctx = snippet[after_idx: after_idx + 3]
+        if before in "，,、" or _LIST_SEPARATOR_AFTER_RE.match(after_ctx):
+            continue  # 列舉雜訊（例如「詹雯婷、羅大佑、蕭敬騰等」「蕭敬騰及經紀人Summer」），不算命中
         return True
     return False
 
