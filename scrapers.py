@@ -2090,14 +2090,35 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
     to_resolve = candidates[:_GOOGLENEWS_MAX_RESOLVE]
     overflow = candidates[_GOOGLENEWS_MAX_RESOLVE:]
 
+    # 2026-07-05 第三次修正（使用者實測發現「窄範圍」新聞稿比對在 Google 新聞這裡
+    # 仍然漏抓）：根本原因是這裡兩條「優雅降級」路徑（轉址解析失敗、超過解析額度）
+    # 完全沒有文章內容可用（不像其他站台的 `context` 好歹還有列表頁摘要），過去
+    # 這兩條路徑一律「只信任標題」直接收錄——但這樣完全繞過了新聞稿主題比對，等於
+    # 「窄範圍」對這兩種降級情境完全沒有作用。實測案例：搜尋「宋念宇」時一篇 2022
+    # 年舊專訪，剛好在正式站台環境反覆命中「轉址解析失敗」這條路徑（可能是雲端
+    # 環境資源較吃緊、Playwright 導航偶爾逾時），導致就算貼了新聞稿也沒被濾掉。
+    #
+    # 使用者這次要的是「精準」，貼新聞稿的目的就是要縮小範圍；如果連驗證的機會
+    # 都沒有，寧可保守排除（不確定就不收錄），也不要因為沒驗證到就照樣放行——這是
+    # 刻意跟系統其他地方「抓不到日期不主動排除」的原則不同的取捨：那條原則是給
+    # 「日期」這種本身有客觀答案、只是抓取失敗的情況；這裡是「這篇文章是不是同一
+    # 事件」這種主觀判斷，沒有貼新聞稿時本來就沒有「同一事件」的概念，但一旦貼了
+    # 新聞稿、又抓不到驗證所需的內容，繼續套用「沒貼新聞稿」的寬鬆邏輯等於讓使用者
+    # 的窄範圍要求形同虛設。
+    has_press_release = bool(press_release_text and len(press_release_text.strip()) >= PRESS_RELEASE_MIN_LEN)
+
     results = []
     for c in to_resolve:
         real_url = _resolve_googlenews_url(page, c["redirect_url"])
         if real_url is None:
-            # 轉址解析失敗：不退回信任 pubDate（已證實不可靠），標記日期不明
+            if has_press_release:
+                continue  # 沒有內容可比對新聞稿主題，貼了新聞稿時保守排除，不退回只信任標題
+            # 沒貼新聞稿：維持舊行為，只信任標題，日期標記不明（不退回信任 pubDate，已證實不可靠）
             results.append({"title": c["title"], "url": c["redirect_url"], "date": None})
             continue
         d, snippet = _fetch_article_content_and_date(real_url)
+        if snippet is None and has_press_release:
+            continue  # 抓不到內文，沒有內容可比對新聞稿主題，貼了新聞稿時保守排除
         keyword_match = _content_keyword_match(c["title"], snippet, [keyword])
         matched, pr_score = _final_match_decision(
             keyword_match, press_release_text, snippet, exclude_terms=[keyword]
@@ -2112,7 +2133,8 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
         results.append(item_out)
 
     for c in overflow:
-        # 同上，不退回信任 pubDate，標記日期不明
+        if has_press_release:
+            continue  # 同上，沒有內容可比對新聞稿主題，貼了新聞稿時保守排除
         results.append({"title": c["title"], "url": c["redirect_url"], "date": None})
 
     return results
