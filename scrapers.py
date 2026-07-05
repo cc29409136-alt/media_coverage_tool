@@ -2024,6 +2024,23 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
     全部解析會讓這個站台單獨拖慢好幾分鐘。超過額度的候選（以及解析失敗的候選）
     優雅降級為舊版「只信任標題」的比對方式（沿用既有的「抓不到就不主動排除」
     精神），不會整批漏掉，只是拿不到內容驗證的準確度優勢。
+
+    2026-07-05 追加修正（實測發現 RSS `pubDate` 本身不可信，不只是「有時抓不到」
+    這麼單純）：直接反覆呼叫 Google 新聞 RSS API 觀察同一篇 2022 年的舊文章
+    （「專訪　關於小宇這個人...」），發現它的 `pubDate` 會隨著時間／查詢關鍵字
+    不同而改變——同一篇文章，用「宋念宇」查詢時回報 2022/06/24（正確），但過一陣子
+    再查（不管用哪個關鍵字）就變成回報「今天」的日期，等於 Google 自己的 RSS
+    metadata 就是錯的、而且會隨時間持續飄移，不是單純的解析失敗。
+
+    這代表 `pubDate` 只能拿來當作「值不值得花解析額度」的陽春預篩選訊號（省成本，
+    篩錯了頂多是浪費/省下一次解析，不影響最終正確性），絕對不能當作候選最終顯示
+    的日期——如果拿真正的文章本頁驗證失敗（`_resolve_googlenews_url()` 解析失敗，
+    或 `_fetch_article_content_and_date()` 抓不到內容），舊版曾經直接退回信任這個
+    不可靠的 `pubDate`，等於把 Google 自己飄移中的錯誤日期原封不動顯示出來（實測
+    案例：這篇 2022 年舊文在某次查詢時 `pubDate` 飄移成當天日期，若解析／內容擷取
+    在正式站台環境剛好失敗，就會顯示成「今天」的報導）。修法：拿不到真正文章本頁
+    日期時，一律標記 `date=None`（沿用「抓不到日期時不主動排除，交給人工判斷」的
+    既有原則），不再退回使用 `pubDate` 本身，避免顯示出一個已知不可靠的日期。
     """
     url = f"https://news.google.com/rss/search?q={quote(keyword)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -2065,23 +2082,24 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
     for c in to_resolve:
         real_url = _resolve_googlenews_url(page, c["redirect_url"])
         if real_url is None:
-            results.append({"title": c["title"], "url": c["redirect_url"], "date": c["rss_date"]})
+            # 轉址解析失敗：不退回信任 pubDate（已證實不可靠），標記日期不明
+            results.append({"title": c["title"], "url": c["redirect_url"], "date": None})
             continue
         d, snippet = _fetch_article_content_and_date(real_url)
-        final_date = d if d is not None else c["rss_date"]
         keyword_match = _content_keyword_match(c["title"], snippet, [keyword])
         matched, pr_score = _final_match_decision(keyword_match, press_release_text, snippet)
         if not matched:
             continue
-        if final_date is not None and not (start_date <= final_date <= end_date):
+        if d is not None and not (start_date <= d <= end_date):
             continue
-        item_out = {"title": c["title"], "url": real_url, "date": final_date}
+        item_out = {"title": c["title"], "url": real_url, "date": d}
         if pr_score is not None:
             item_out["press_release_score"] = pr_score
         results.append(item_out)
 
     for c in overflow:
-        results.append({"title": c["title"], "url": c["redirect_url"], "date": c["rss_date"]})
+        # 同上，不退回信任 pubDate，標記日期不明
+        results.append({"title": c["title"], "url": c["redirect_url"], "date": None})
 
     return results
 
