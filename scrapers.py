@@ -103,11 +103,20 @@ def _clean_title(title):
 # 但緊接著又是「）、」（右括號＋頓號）接另一個人名，代表這整個結構其實還是
 # 一份人名清單的其中一項，不是真的在介紹、談論這個人。所以也要檢查關鍵字
 # 「後面」有沒有緊跟著列舉分隔符號（可能隔著一個右括號），有的話一樣不算命中。
-# 除了逗號/頓號，中文列舉也常在最後兩項之間用「與」「和」「跟」「及」這類連接詞
+# 除了頓號，中文列舉也常在最後兩項之間用「與」「和」「跟」「及」這類連接詞
 # 取代頓號（例如「小宇（宋念宇）與孫盛希擔任音樂製作人」），一樣要視為列舉、
 # 不算命中。
-_LIST_SEPARATOR_BEFORE = "，,、"
-_LIST_SEPARATOR_AFTER_RE = re.compile(r'^[）)]?([，,、]|與|和|跟|及)')
+#
+# 2026-07-05 修正（實測發現真陽性被誤殺的回歸）：這裡原本把「逗號」跟「頓號」
+# 一視同仁都當作列舉分隔符號，但實測發現這個假設太寬鬆——中文逗號是泛用的
+# 子句分隔符，「出發前，蕭敬騰先在社群發文詢問」「蕭敬騰，這趟花蓮行收穫滿滿」
+# 這類完全正常的敘述句，主詞名字前後緊接著逗號是家常便飯，不代表任何列舉語意
+# （反觀頓號在中文裡幾乎專門用在列舉，很少出現在其他語境）。用逗號當列舉訊號
+# 會把大量真正相關的報導內文（og:description 通常是完整散文句子，不是標題式
+# 短語）錯判成「列舉雜訊」而排除掉。因此改成只用頓號／連接詞判斷列舉，逗號
+# 不再視為列舉分隔符號。
+_LIST_SEPARATOR_BEFORE = "、"
+_LIST_SEPARATOR_AFTER_RE = re.compile(r'^[）)]?(、|與|和|跟|及)')
 
 
 def _has_nickname_intro(text, keyword):
@@ -546,25 +555,47 @@ def _title_keyword_is_affiliation_only(title, keyword):
     return seen_any
 
 
+_SNIPPET_LIST_SEPARATOR_AFTER_RE = re.compile(r'^[）)]?、')
+
+
+def _snippet_keyword_hit(snippet, keyword):
+    """檢查關鍵字是否以「非純列舉雜訊」的方式出現在文章內文摘要（完整句子的散文）裡。
+
+    刻意不重用 `_has_nickname_intro`／`_LIST_SEPARATOR_AFTER_RE`（設計給短標題／
+    list-page context 用，包含「與/和/跟/及」這類連接詞判斷），這裡只用「頓號」
+    當列舉訊號：2026-07-05 實測發現連接詞在完整句子情境下常常是用來描述「這個人
+    跟另一個人的關係／互動」，不是「無關列舉」——例如「金曲歌王蕭敬騰與經紀人
+    老婆Summer登記結婚」（真陽性，蕭敬騰是這句話的主詞之一，在做「登記」這個動作）
+    跟「被質疑對提攜她出道的蕭敬騰及經紀人Summer缺乏感恩之心」（假陽性，蕭敬騰
+    只是「對...」這個介詞片語裡的受詞，句子真正的主詞是「她」＝艾薇）兩句話的
+    表面文字結構幾乎一樣（都是「關鍵字＋連接詞＋經紀人[老婆]Summer」），用連接詞
+    當雜訊訊號在這裡沒辦法分辨，而且會把前者這種完全正常、描述本人婚姻/感情關係
+    的真陽性一併誤殺。頓號則幾乎專門用在中文列舉，很少出現在描述人物關係的語境，
+    保留頓號判斷仍能抓到「詹雯婷、羅大佑、蕭敬騰、丁噹」這類真正的雜訊列舉。
+    """
+    idx = snippet.find(keyword)
+    if idx == -1:
+        return False
+    before = snippet[idx - 1] if idx > 0 else ""
+    after_ctx = snippet[idx + len(keyword): idx + len(keyword) + 3]
+    if before == "、" or _SNIPPET_LIST_SEPARATOR_AFTER_RE.match(after_ctx):
+        return False
+    return True
+
+
 def _content_keyword_match(title, snippet, keywords):
     """文章本頁內容驗證用的關鍵字命中判斷。跟 `_filter()` 的邏輯保持一致的嚴謹標準：
     標題命中原則上算數（便宜、可信），但排除「純掛名所屬公司」的情況（見上方
-    `_title_keyword_is_affiliation_only` 說明）；內容摘要則同時接受「暱稱緊接本名」
-    的鄰接比對（`_has_nickname_intro`，跟列表頁摘要比對用同一份規則），以及「關鍵字
-    整段直接出現在摘要、且不是逗號/頓號/連接詞列舉雜訊的一部分」的子字串比對。
+    `_title_keyword_is_affiliation_only` 說明）；內容摘要則用 `_snippet_keyword_hit()`
+    （見上方說明，只把頓號當列舉雜訊訊號，不含連接詞）判斷關鍵字是否以非列舉雜訊
+    的方式出現。
 
     這裡原本想單純用「關鍵字有出現在摘要就算命中」（比列表頁摘要比對更寬鬆一點，
     理由是 og:description／內文前幾段通常是 CMS 寫的完整導言散文，不是「一堆人名
     逗號列舉」的雜訊來源）——但實測驗證蕭敬騰基準案例時發現這個假設不成立：
     自由時報一篇報導的 og:description 內容是「...曾參與「Faye」詹雯婷、羅大佑、
     蕭敬騰等大咖音樂人現場演出...」，關鍵字前面剛好是「、」，証明列舉雜訊一樣會
-    出現在文章導言裡，不是只有列表頁的「相關文章」推薦區塊才有。所以子字串比對
-    這裡加一道跟 `_has_nickname_intro` 同精神的列舉分隔符號防呆：只要關鍵字緊鄰
-    前一個字是逗號/頓號、或後面緊接著逗號/頓號/與/和/跟/及這類連接詞（沿用
-    `_LIST_SEPARATOR_AFTER_RE`，跟 `_has_nickname_intro` 用同一份規則，修正舊版
-    子字串比對這裡漏檢查連接詞、只檢查逗號頓號的不一致——實測「蕭敬騰及經紀人
-    Summer」這類用「及」而非頓號列舉的案例，舊版子字串比對會漏放行），就視為
-    列舉雜訊、不算單純子字串命中。
+    出現在文章導言裡，不是只有列表頁的「相關文章」推薦區塊才有。
 
     2026-07-05 新增第二道防呆：實測發現「標題掛名，但內文完全沒提到這個人」的
     clickbait 案例——例如「蕭敬騰提拔出道！艾薇遭爆「忘恩負義抱怨公司」經紀人發聲
@@ -575,11 +606,22 @@ def _content_keyword_match(title, snippet, keywords):
     太洗腦」等），內文摘要都會明確再次提到「蕭敬騰」——這是很自然的道理：記者真的
     在寫這個人的新聞，內文一定會再帶到他的名字，不會只在標題出現過一次就不再提。
     因此新增規則：如果有抓到 `snippet`（代表這篇文章的驗證有真的成功造訪到本頁），
-    標題命中「必須」在 snippet 裡也找得到這個關鍵字才算數；抓不到 snippet（驗證
-    失敗、優雅降級）時維持原樣只信任標題，不受這條規則影響（沒有 snippet 可以
-    交叉驗證，比照舊版行為）。這比前面「所有格掛名」的判斷更通用，同時也覆蓋了
-    「曾與蕭敬騰、羅大佑合作」這類標題列舉雜訊案例（這篇的 snippet 同樣完全沒有
-    再提到「蕭敬騰」），不需要額外幫標題比對另外寫一份列舉雜訊防呆。
+    標題命中「必須」在 snippet 裡也以非列舉雜訊的方式再次出現這個關鍵字才算數；
+    抓不到 snippet（驗證失敗、優雅降級）時維持原樣只信任標題，不受這條規則影響
+    （沒有 snippet 可以交叉驗證，比照舊版行為）。這比前面「所有格掛名」的判斷更
+    通用，同時也覆蓋了「曾與蕭敬騰、羅大佑合作」這類標題列舉雜訊案例（這篇的
+    snippet 是「...詹雯婷、羅大佑、蕭敬騰、丁噹...」，關鍵字確實出現在 snippet
+    裡，但只是頓號列舉的一部分，不算數）。
+
+    重要：這條「標題命中需要 snippet 佐證」的規則，只套用在「關鍵字真的有出現在
+    標題」的情況；如果關鍵字根本不在標題（例如標題只用暱稱，使用者搜尋的是本名），
+    改成單獨看 snippet 命中與否即可決定，不需要「雙重確認」——這裡沒有「標題」這個
+    第一層訊號可以佐證，單靠 snippet 命中已經是唯一可用的證據，不應該因為標題沒有
+    這個名字就連 snippet 命中都不算數。同樣地，如果標題命中被「純掛名所屬公司」
+    判定否決（`_title_keyword_is_affiliation_only`），也不允許退回單靠 snippet
+    佐證就算數——這是刻意的設計：標題已經明確判斷這個人在文章裡只是所有格修飾語
+    （不是文章主角），不應該因為 snippet 剛好也提到（哪怕是用非列舉的方式提到）
+    就推翻這個判斷。
 
     這個函式本身「不」處理新聞稿相似度——那是額外的獨立信號，由呼叫端
     `_verify_candidates()` 在拿到這裡的布林結果之後，再視情況合併新聞稿相似度分數
@@ -587,22 +629,14 @@ def _content_keyword_match(title, snippet, keywords):
     職責切分，方便沒有貼新聞稿的情境可以單獨呼叫這裡、行為完全不變。
     """
     for k in keywords:
-        title_hit = k in title and not _title_keyword_is_affiliation_only(title, k)
-        if title_hit and (not snippet or k in snippet):
+        in_title = k in title
+        title_hit = in_title and not _title_keyword_is_affiliation_only(title, k)
+        snippet_hit = bool(snippet) and _snippet_keyword_hit(snippet, k)
+
+        if title_hit and (not snippet or snippet_hit):
             return True
-        if not snippet:
-            continue
-        if _has_nickname_intro(snippet, k):
+        if not in_title and snippet_hit:
             return True
-        idx = snippet.find(k)
-        if idx == -1:
-            continue
-        before = snippet[idx - 1] if idx > 0 else ""
-        after_idx = idx + len(k)
-        after_ctx = snippet[after_idx: after_idx + 3]
-        if before in "，,、" or _LIST_SEPARATOR_AFTER_RE.match(after_ctx):
-            continue  # 列舉雜訊（例如「詹雯婷、羅大佑、蕭敬騰等」「蕭敬騰及經紀人Summer」），不算命中
-        return True
     return False
 
 
