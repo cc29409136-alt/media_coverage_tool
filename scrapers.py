@@ -15,7 +15,6 @@ from matcher import (
     press_release_similarity,
     PRESS_RELEASE_MIN_LEN,
     PRESS_RELEASE_HIGH_THRESHOLD,
-    PRESS_RELEASE_CORROBORATE_THRESHOLD,
 )
 
 TODAY = date.today()
@@ -561,30 +560,40 @@ def _final_match_decision(keyword_match, press_release_text, snippet):
     """在既有的關鍵字／暱稱鄰接判斷（`keyword_match`）之上，疊加「新聞稿全文相似度」
     這個額外信號，回傳 (是否命中, 相似度分數或 None)。
 
-    背景：即使關鍵字／暱稱鄰接比對已經很嚴謹（見 `_has_nickname_intro`／
-    `_content_keyword_match` 上方說明），還是有「文章確實提到搜尋對象、寫法也不是
-    列舉雜訊，但其實是另一則新聞」的案例（例如藝人以固定班底/導師身份出現在別的
-    節目報導中，介紹句型跟「這篇文章真的在談論這個人的這則新聞」在句子層級完全
-    無法區分）。使用者貼上新聞稿全文後，可以用「文章內容跟新聞稿內容的相似度」
-    作為更強的信號：真正相關的報導即使改寫過用詞，內容重疊度仍明顯高於單純掛名
-    提及的雜訊文章（見 `matcher.press_release_similarity` docstring 的實測數據）。
+    2026-07-05 修正（實測發現嚴重的漏抓回歸）：舊版邏輯讓相似度分數可以「反否決」
+    已經通過 `keyword_match` 的候選（分數低於 `PRESS_RELEASE_CORROBORATE_THRESHOLD`
+    就整篇排除），原意是濾掉「掛名提及但其實是另一則新聞」的雜訊。但實測「蕭敬騰
+    花蓮開唱」真實案例：Yahoo 站台不貼新聞稿時正確找到 7 篇同一事件的報導，貼上
+    新聞稿全文後卻只剩 1 篇——因為同一事件不同媒體記者各自改寫、引用不同的談話
+    片段，`press_release_similarity()` 算出來的分數大多落在 0.05~0.15 之間（都低於
+    0.12 的佐證門檻），連明顯是同一則新聞的報導都被反否決掉。這證明「相似度不夠
+    高就反否決關鍵字命中」這個假設不成立：不同記者改寫的自然變異幅度，跟「這篇
+    其實是另一則新聞」的變異幅度沒有清楚的分數界線可以切開（先前只用單一案例
+    校準門檻，沒有涵蓋這種「同事件、多記者改寫」的常見情境）。
+
+    這個工具的核心目的是「媒體露出整理」，漏掉真正的報導比多顯示一兩篇邊緣案例
+    的代價更高（使用者本來就會人工看過結果，多顯示的可以自己刪，漏掉的卻無從
+    發現）。因此改成：新聞稿相似度只能「加分」（讓關鍵字沒命中的候選也有機會
+    透過高相似度被納入，見下方 (b)），不能「扣分」否決已經通過既有嚴謹關鍵字／
+    暱稱鄰接比對（`_has_nickname_intro`／`_content_keyword_match` 的列舉雜訊防呆）
+    的候選——原本要防的「掛名提及」誤判，交給既有的關鍵字/暱稱鄰接比對本身的
+    嚴謹度把關即可，不再疊加這層相似度反否決。
 
     判斷邏輯（`press_release_text` 有效時）：
-    - (a) 關鍵字比對已命中 AND 相似度 >= 一般門檻（佐證）：命中。
-    - (b) 相似度 >= 高信心門檻（即使關鍵字比對沒命中，例如文章改寫幅度大，暱稱鄰接
-      句型比對不到）：命中。
-    - 其餘情況：不命中——包含「關鍵字比對命中但相似度過低」，這正是本次要解決的
-      「掛名提及但其實是另一則新聞」案例，新聞稿相似度在這裡負責「反否決」。
+    - (a) 關鍵字比對已命中：一律命中，相似度分數僅供參考（顯示用），不影響是否收錄。
+    - (b) 關鍵字比對沒命中，但相似度 >= 高信心門檻（文章改寫幅度大、暱稱鄰接
+      句型比對不到，但內容明顯跟新聞稿是同一則事件）：一樣視為命中。
+    - 其餘情況（關鍵字沒命中、相似度也不夠高）：不命中。
 
     `press_release_text` 為空/太短（見 `PRESS_RELEASE_MIN_LEN`）或沒有 snippet 可比對時，
     完全不套用新聞稿相似度，原樣回傳既有的 `keyword_match` 布林值——維持沒有貼新聞稿
-    情境下的既有行為不變，這是今天已大量驗證過的多數使用情境，不能因為這次改版受影響。
+    情境下的既有行為不變。
     """
     if not press_release_text or len(press_release_text.strip()) < PRESS_RELEASE_MIN_LEN or not snippet:
         return keyword_match, None
 
     score = press_release_similarity(press_release_text, snippet)
-    if keyword_match and score >= PRESS_RELEASE_CORROBORATE_THRESHOLD:
+    if keyword_match:
         return True, score
     if score >= PRESS_RELEASE_HIGH_THRESHOLD:
         return True, score
@@ -1026,14 +1035,65 @@ def search_ctinews(page, keyword, start_date, end_date, press_release_text=None)
 def search_ftvnews(page, keyword, start_date, end_date, press_release_text=None):
     """搜尋結果列表頁維持 Playwright：網站有 Cloudflare JS 挑戰頁（"Just a moment..."），
     純 requests 呼叫會被擋下回傳 403，需要真實瀏覽器執行 JS 才能通過驗證並取得搜尋結果。
-    個別文章頁若同樣被 Cloudflare 擋下，`_verify_candidates()` 的 `_fetch_article_content_and_date`
-    會直接請求失敗（RequestException），此時會自動退回列表頁摘要比對／date=None 保留，
-    不會整批漏收，只是這種情況下拿不到內容驗證的準確度優勢。"""
+
+    2026-07-05 修正（實測發現的日期不準確案例，使用者回報搜尋 2026/07/01~07/02 的
+    「蕭敬騰」卻出現 2026/06/29 的舊聞）：根本原因比 setn／taisounds 那類「overflow
+    桶跳過日期檢查」更嚴重——這個網站的 Cloudflare 挑戰不只擋搜尋結果頁，連「個別
+    文章頁」都一樣擋（實測 `requests.get()` 對文章頁一律回傳 403 "Just a moment..."）。
+    這代表 `_verify_candidates()` 的 `_fetch_article_content_and_date()`（純 `requests`
+    呼叫）對這個站台永遠會失敗，不是只有 overflow 桶的候選、而是「全部」候選都會
+    優雅降級成列表頁摘要比對、日期一律 `date=None`，等於這個站台的日期過濾從來沒有
+    真正生效過（先前的 docstring 只寫了「拿不到內容驗證的準確度優勢」，沒意識到日期
+    過濾也一併完全失效）。
+
+    這裡也一併發現：舊版單純 `page.goto()`（沒有隱藏 headless 特徵）實測有時連
+    搜尋結果頁本身都會被 Cloudflare 擋下（"Just a moment..." 標題、抓不到任何搜尋
+    結果），只是不是每次都會發生，運氣好時仍能拿到真正的搜尋結果——這解釋了為什麼
+    這個 bug 只在部分次數的搜尋中出現。實測發現只要多加一行隱藏
+    `navigator.webdriver` 的 init script（`page.context` 既有的 UA／locale 設定
+    已經是 app.py 提供的正常 Chrome UA，不需要動 app.py），穩定通過 Cloudflare 的
+    JS 挑戰（本機測試多次皆穩定成功，不需要修改 app.py 共用的瀏覽器啟動參數）。
+
+    真正的修法：既然文章本頁永遠拿不到（Cloudflare 擋 `requests`），改用「列表頁
+    本身」的日期——每張搜尋結果卡片的 `<div class="time" data-time="YYYY/MM/DD
+    HH:MM:SS">` 屬性本身就是可信的發布時間（已實測跟卡片顯示的文字完全一致），
+    在丟進 `_candidate_filter()`／`_verify_candidates()` 之前，先用這個日期做預先
+    過濾（同 search_cts／search_setn／search_taisounds 的精神）。範圍外的候選
+    直接不列入，不會再有機會透過「文章頁驗證必然失敗 → 退回列表摘要比對 →
+    date=None 一律通過」這條路徑漏出去。
+    """
     kw = quote(keyword)
     url = f"https://www.ftvnews.com.tw/search/{kw}"
+    page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     page.goto(url, timeout=20000, wait_until="load")
     page.wait_for_timeout(1500)
-    links = _all_links(page)
+    try:
+        items = page.eval_on_selector_all(
+            "section.search-list li",
+            """els => els.map(e => {
+                const a = e.querySelector('a[href*="/news/detail/"]');
+                const timeEl = e.querySelector('div.time');
+                const titleEl = e.querySelector('div.title');
+                const summaryEl = e.querySelector('div.summary');
+                return {
+                    href: a ? a.href : null,
+                    title: titleEl ? titleEl.textContent.trim() : (a ? a.textContent.trim() : ''),
+                    dataTime: timeEl ? timeEl.getAttribute('data-time') : null,
+                    summary: summaryEl ? summaryEl.textContent.trim() : ''
+                };
+            })""",
+        )
+    except Exception:
+        items = []
+    links = []
+    for it in items:
+        href = it.get("href")
+        if not href or not it.get("title"):
+            continue
+        pub_d = _parse_date_string(it.get("dataTime")) if it.get("dataTime") else None
+        if pub_d is not None and not (start_date <= pub_d <= end_date):
+            continue  # 列表頁自帶可信日期，範圍外提早排除，不佔驗證額度（同 search_cts／search_setn）
+        links.append({"title": it["title"], "href": href, "context": it.get("summary") or it["title"]})
     candidates = _candidate_filter(links, ["ftvnews.com.tw/news/detail/"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
