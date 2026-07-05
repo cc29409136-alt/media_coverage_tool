@@ -524,25 +524,42 @@ def _candidate_filter(links, url_must_contain, min_len=6):
     return results
 
 
-# 2026-07-05 新增：標題裡關鍵字「只是被提到所屬公司/團隊」的所有格用法偵測。
+# 2026-07-05 新增：標題／內文摘要裡關鍵字「只是被提到所屬公司/團隊/人際關係」的
+# 所有格用法偵測。
 # 背景（實測案例）：搜尋「蕭敬騰」時出現「才說「不想去台灣發展」！艾薇遭控「忘恩
 # 負義」蕭敬騰　公司緊急發聲」這類新聞——文章真正的主角是艾薇（她的爭議發言），
 # 蕭敬騰只是被提到「他的經紀公司」出面回應，本人並未真正被報導。這種情況舊版邏輯
 # 會誤判命中，因為標題比對是「只要關鍵字出現在標題就算數」，完全沒檢查關鍵字在
 # 標題裡扮演的是「文章主角」還是「所有格修飾語」。使用者確認這類新聞不算他要的
-# 媒體露出（明確要求濾掉），所以這裡新增判斷：如果標題裡「每一次」出現關鍵字都
-# 緊接著「公司／經紀公司／旗下／老闆／東家」這類所有格詞（中間可以夾標點符號或
-# 空白，例如「蕭敬騰　公司緊急發聲」的全形空白、「蕭敬騰！經紀公司回應了」的
-# 驚嘆號），就視為「純掛名」、標題比對不算數，改退回檢查內文摘要是否有更實質的
-# 命中證據（如果內文摘要也只是提到公司、或根本沒提到，就正確判定不命中）。
-# 只要有任何一次出現不是這個所有格樣式（代表關鍵字本人才是文章討論的對象，例如
-# 「蕭敬騰認「沒人call我」」），就不算純掛名，標題比對照舊算命中。
-_AFFILIATION_AFTER_RE = re.compile(r'^[的，,、！!？?\s　]{0,3}(經紀公司|公司|旗下|老闆|東家)')
+# 媒體露出（明確要求濾掉），所以新增判斷：如果關鍵字緊接著「公司／經紀公司／
+# 旗下／老闆／東家」這類所有格詞（中間可以夾標點符號或空白，例如「蕭敬騰　公司
+# 緊急發聲」的全形空白、「蕭敬騰！經紀公司回應了」的驚嘆號），就視為「純掛名」，
+# 這次出現不算數。
+#
+# 後來又實測到同一類但用不同名詞的案例：「來自馬來西亞的歌手艾薇...並在台灣
+# 出道、成為大咖歌王蕭敬騰的師妹」——這篇主角同樣是艾薇，「蕭敬騰的師妹」只是
+# 用來介紹艾薇背景的所有格片語（描述艾薇跟蕭敬騰的師徒/同門關係），蕭敬騰本人
+# 沒有真正出現在這則新聞裡。所以把所有格名詞清單擴大到常見的演藝圈人際關係詞
+# （師妹/師弟/徒弟/學生/粉絲/經紀人，以及配偶/伴侶關係詞），只要清單持續發現
+# 遺漏就繼續擴充，這類「掛名所有格修飾語」在中文娛樂新聞標題裡的變化很多，
+# 沒辦法一次窮舉，只能實測發現一種、擴充一種。
+_AFFILIATION_AFTER_RE = re.compile(
+    r'^[的，,、！!？?\s　]{0,3}'
+    r'(經紀公司|公司|旗下|老闆|東家|師妹|師弟|徒弟|學生|粉絲|經紀人|'
+    r'老婆|老公|太太|丈夫|女友|男友|前女友|前男友)'
+)
+
+
+def _is_affiliation_mention(text, idx, keyword):
+    """檢查 `text` 中位置 `idx` 開始的關鍵字，是不是純粹被當作所有格修飾語
+    （見上方模組說明）帶出另一個人／團隊，不是文章真正在談論的對象。"""
+    after = text[idx + len(keyword):]
+    return bool(_AFFILIATION_AFTER_RE.match(after))
 
 
 def _title_keyword_is_affiliation_only(title, keyword):
     """回傳 True 代表標題裡「每一次」出現關鍵字，都屬於下面兩種非主角情境之一：
-    (a) 純掛名所屬公司（見上方模組說明），或
+    (a) 純掛名所有格修飾語（見上方模組說明），或
     (b) 假冒／開玩笑自稱是這個人（見 `_is_false_self_claim()`，例如「他夜市自稱
         「我是蕭敬騰」笑翻全場」——這篇主角是別人，蕭敬騰只是被拿來當假名開玩笑）。
     只要有任何一次出現不屬於這兩種情境（代表關鍵字本人才是文章討論的對象），
@@ -555,8 +572,7 @@ def _title_keyword_is_affiliation_only(title, keyword):
         if idx == -1:
             break
         seen_any = True
-        after = title[idx + len(keyword):]
-        if not _AFFILIATION_AFTER_RE.match(after) and not _is_false_self_claim(title, idx):
+        if not _is_affiliation_mention(title, idx, keyword) and not _is_false_self_claim(title, idx):
             return False
         idx += len(keyword)
     return seen_any
@@ -599,12 +615,16 @@ def _snippet_keyword_hit(snippet, keyword):
     保留頓號判斷仍能抓到「詹雯婷、羅大佑、蕭敬騰、丁噹」這類真正的雜訊列舉。
 
     另外也用 `_is_false_self_claim()` 排除「假冒／開玩笑自稱是這個人」的句型
-    （見該函式說明），這是另一類跟列舉雜訊完全不同的假陽性樣式。
+    （見該函式說明），以及 `_is_affiliation_mention()` 排除「純掛名所有格修飾語」
+    （見該函式說明——2026-07-05 實測發現這個問題不只發生在標題，內文摘要也會有
+    「...並在台灣出道、成為大咖歌王蕭敬騰的師妹...」這類寫法，主角其實是另一個人，
+    蕭敬騰只是用來描述背景關係的所有格片語），這兩類都是跟列舉雜訊完全不同的
+    假陽性樣式。
     """
     idx = snippet.find(keyword)
     if idx == -1:
         return False
-    if _is_false_self_claim(snippet, idx):
+    if _is_false_self_claim(snippet, idx) or _is_affiliation_mention(snippet, idx, keyword):
         return False
     before = snippet[idx - 1] if idx > 0 else ""
     after_ctx = snippet[idx + len(keyword): idx + len(keyword) + 3]
@@ -767,9 +787,20 @@ def _verify_candidates(candidates, keyword, start_date, end_date,
                     if not matched:
                         continue
                 else:
-                    # 造訪失敗／抓不到內容摘要：優雅降級，退回列表頁摘要比對
-                    # （沒有 snippet 可用，新聞稿相似度無從比對，直接沿用舊版邏輯）
-                    if not any(k in c["title"] or _has_nickname_intro(c["context"], k) for k in keywords):
+                    # 造訪失敗／抓不到內容摘要：優雅降級，退回列表頁摘要比對。
+                    # 2026-07-05 修正：這裡原本是獨立的陽春檢查（`k in title` 完全
+                    # 不檢查所有格掛名／假冒句型，`_has_nickname_intro(context, k)`
+                    # 也沒有這兩種防呆），導致 Cloudflare 會擋下「文章本頁」請求的
+                    # 站台（例如 ftvnews：列表頁本身用 Playwright 能拿到，但
+                    # `_fetch_article_content_and_date` 用 plain requests 造訪個別
+                    # 文章頁一律被擋、snippet 恆為 None，等於這個站台的每一篇候選
+                    # 都會走這條退回路徑）完全繞過本次新增的所有假陽性防呆（純掛名
+                    # 公司、內文列舉雜訊、假冒自稱），已修好的「曾與蕭敬騰、羅大佑
+                    # 合作」「向佐...自稱我是蕭敬騰」這類案例會在這些站台重新冒出來。
+                    # 改成直接重用 `_content_keyword_match()`，把 `context`（列表頁
+                    # 摘要）當作退化版的 snippet 傳進去，套用完全相同的判斷標準，
+                    # 不再維護第二套比對邏輯。
+                    if not _content_keyword_match(c["title"], c["context"], keywords):
                         continue
 
                 if d is not None and not (start_date <= d <= end_date):
@@ -780,7 +811,8 @@ def _verify_candidates(candidates, keyword, start_date, end_date,
                 results.append(item)
 
     for c in overflow:
-        if not any(k in c["title"] or _has_nickname_intro(c["context"], k) for k in keywords):
+        # 同上，重用 `_content_keyword_match()` 而非獨立的陽春檢查
+        if not _content_keyword_match(c["title"], c["context"], keywords):
             continue
         results.append({"title": c["title"], "url": c["url"], "date": None})
 
