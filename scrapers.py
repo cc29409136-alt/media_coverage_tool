@@ -1906,23 +1906,63 @@ def search_setn(page, keyword, start_date, end_date, press_release_text=None):
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
 
-def search_googlenews(page, keyword, start_date, end_date, press_release_text=None):
-    """Google 新聞 RSS 搜尋（聚合各媒體報導，不需要 Playwright page）。
-    刻意不套用本次新增的「造訪文章本頁驗證」流程（`_verify_candidates()`）：Google News RSS
-    回傳的 <link> 不是文章真正的網址，而是 Google 自己的轉址短碼（例如
-    news.google.com/rss/articles/CBMi...），要拿到真正的文章網址得先讓瀏覽器執行一段
-    client-side redirect，plain requests 直接 GET 這個網址通常只會拿到轉址頁本身，
-    抓不到目標文章的內容——這跟其他站台「文章網址本來就是真的，只是列表頁摘要不可靠」
-    的情境不一樣，這裡要驗證的話等於要多一層「先解析出真正網址」的機制，複雜度／
-    額外請求數不成比例（這個來源本身是聚合上百篇其他站台文章的入口，只是給使用者
-    看有沒有露出、真正的完整報導使用者會點進去看，不是本比對系統唯一的正確性防線）。
-    維持原本「關鍵字必須出現在標題」的比對（比 `_filter()` 標準略嚴格，因為沒有摘要
-    可以做暱稱鄰接比對），跟其他站台一致的地方是：仍然不接受更寬鬆的比對規則。
+_GOOGLENEWS_MAX_RESOLVE = 60  # 每次搜尋最多解析幾篇 Google 新聞轉址網址（見下方說明）
+# 使用者已明確表示「準確比速度重要」，這裡刻意調高（而非跟其他站台一樣用 20），
+# 因為 RSS 日期預先過濾後，就算是常見關鍵字＋合理的幾天搜尋範圍，候選數實測仍
+# 常常有 30~60 篇（Google 新聞聚合太多站台、同一事件常被多家轉載），沿用 20 會
+# 讓超過一半的候選都落入「只信任標題」的舊版降級路徑，等於這次改版的效果打對折。
+# 真正限制解析時間的是使用者自己設定的日期區間（區間越窄，RSS 預先過濾後的候選
+# 越少），不需要另外用一個偏低的固定上限去限制，只保留這個上限防止極端情況
+# （例如關鍵字太籠統＋區間開太寬）真的解析到數百篇拖垮效能。
 
-    `press_release_text` 參數在這裡刻意保留但不使用：新聞稿相似度比對需要文章本頁
-    內容摘要（見 `_final_match_decision()`），這個函式從不造訪文章本頁，沒有內容
-    可以比對，套用了也沒有效果，因此原樣接受參數以維持跟其他 `search_*` 函式一致的
-    呼叫簽章（`app.py` 統一呼叫），但不影響這裡的比對邏輯。"""
+
+def _resolve_googlenews_url(page, redirect_url, timeout=15000, poll_ms=200, max_polls=30):
+    """用 Playwright 導航到 Google 新聞轉址網址（`news.google.com/rss/articles/CBMi...`），
+    等待它自己的 client-side JS 轉址完成後取得真正的文章網址。只等到 `commit`
+    （導航開始、HTML 開始下載）就返回，不等整頁資源／圖片全部載入完成（`load`／
+    `networkidle`），再用短間隔輪詢等 `page.url` 離開 news.google.com 網域——實測這樣
+    平均每篇約 1.5 秒，比等 `load` 快很多（Google 新聞轉址頁本身很肥，載入所有資源
+    要好幾秒）。逾時仍停留在 news.google.com 網域，代表這篇轉址解析失敗（可能是
+    文章已下架／轉址規則變動），回傳 None，呼叫端會優雅降級退回舊版「只信任標題」
+    的比對方式，不會整篇直接漏掉。"""
+    try:
+        page.goto(redirect_url, timeout=timeout, wait_until="commit")
+    except Exception:
+        return None
+    for _ in range(max_polls):
+        if "news.google.com" not in page.url:
+            return page.url
+        page.wait_for_timeout(poll_ms)
+    return None
+
+
+def search_googlenews(page, keyword, start_date, end_date, press_release_text=None):
+    """Google 新聞 RSS 搜尋（聚合各媒體報導）。
+
+    2026-07-05 修正（實測發現：這個站台完全繞過本次新增的整套「內容驗證＋新聞稿
+    比對」流程，只看「關鍵字有沒有出現在標題」，導致其他站台已經修好的假陽性
+    （例如「蕭敬騰提拔出道！艾薇遭爆...」「才說不想去台灣發展！艾薇遭控...蕭敬騰
+    公司緊急發聲」）在 Google 新聞這裡完全沒被濾掉，一樣顯示出來——這些其實是
+    同樣幾篇文章，只是透過 Google 新聞這個聚合入口又出現一次）。
+
+    舊版刻意不解析 Google News RSS 的轉址網址（`news.google.com/rss/articles/CBMi...`
+    是 Google 自己的轉址短碼，不是文章真正的網址，plain requests 直接 GET 只會拿到
+    轉址頁本身，需要瀏覽器執行 JS 才能取得真正網址），理由是「複雜度／額外請求數
+    不成比例」——但使用者明確反映寧可慢一點也要準，所以這裡改成：先用 RSS 自帶的
+    `pubDate` 做預先過濾（跟 `search_cts()` 同精神，範圍外的候選提早排除、不占用
+    下面的解析額度），依日期新到舊排序後，對前 `_GOOGLENEWS_MAX_RESOLVE` 篇候選
+    用 `_resolve_googlenews_url()` 解析出真正的文章網址，再用共用的
+    `_fetch_article_content_and_date()` 抓文章內容，套用跟其他站台完全一樣的
+    `_content_keyword_match()`／`_final_match_decision()` 判斷（含所有已驗證過的
+    假陽性防呆：純掛名所屬公司、內文列舉雜訊等），確保 Google 新聞這個聚合入口
+    跟直接造訪各家站台的準確度一致，不會又把已經修好的假陽性透過這裡重新洩漏。
+
+    解析額度限制的原因：每篇候選都要開一次真的瀏覽器分頁導航（不像其他站台可以
+    純 `requests.get()`），比其他站台貴很多，常見關鍵字一次可能有數十篇候選，
+    全部解析會讓這個站台單獨拖慢好幾分鐘。超過額度的候選（以及解析失敗的候選）
+    優雅降級為舊版「只信任標題」的比對方式（沿用既有的「抓不到就不主動排除」
+    精神），不會整批漏掉，只是拿不到內容驗證的準確度優勢。
+    """
     url = f"https://news.google.com/rss/search?q={quote(keyword)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -1934,7 +1974,8 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
         return []
-    results = []
+
+    candidates = []
     for item in root.findall(".//item"):
         title_el = item.find("title")
         link_el = item.find("link")
@@ -1949,9 +1990,37 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
                 d = parsedate_to_datetime(pubdate_el.text).date()
             except (TypeError, ValueError):
                 d = None
-        if d and not (start_date <= d <= end_date):
+        if d is not None and not (start_date <= d <= end_date):
+            continue  # RSS 本身就給了發布時間，範圍外提早排除，不佔解析額度（同 search_cts）
+        candidates.append({"title": title, "redirect_url": link, "rss_date": d})
+
+    # 依 RSS 日期新到舊排序，確保有限的解析額度優先用在最新的候選
+    candidates.sort(key=lambda c: c["rss_date"] or date.min, reverse=True)
+    to_resolve = candidates[:_GOOGLENEWS_MAX_RESOLVE]
+    overflow = candidates[_GOOGLENEWS_MAX_RESOLVE:]
+
+    results = []
+    for c in to_resolve:
+        real_url = _resolve_googlenews_url(page, c["redirect_url"])
+        if real_url is None:
+            results.append({"title": c["title"], "url": c["redirect_url"], "date": c["rss_date"]})
             continue
-        results.append({"title": title, "url": link, "date": d})
+        d, snippet = _fetch_article_content_and_date(real_url)
+        final_date = d if d is not None else c["rss_date"]
+        keyword_match = _content_keyword_match(c["title"], snippet, [keyword])
+        matched, pr_score = _final_match_decision(keyword_match, press_release_text, snippet)
+        if not matched:
+            continue
+        if final_date is not None and not (start_date <= final_date <= end_date):
+            continue
+        item_out = {"title": c["title"], "url": real_url, "date": final_date}
+        if pr_score is not None:
+            item_out["press_release_score"] = pr_score
+        results.append(item_out)
+
+    for c in overflow:
+        results.append({"title": c["title"], "url": c["redirect_url"], "date": c["rss_date"]})
+
     return results
 
 
@@ -2006,4 +2075,5 @@ PLAYWRIGHT_REQUIRED_SITES = {
     "insightpost",  # 整站為前端 JS SPA
     "setn",         # ASP.NET WebForms postback，需要真的填表單＋按 Enter 觸發搜尋
     "enews",        # 依賴 Google 自訂搜尋（CSE）小工具，結果由 cse.js 動態 XHR＋簽章 token 載入，需要真實瀏覽器執行
+    "googlenews",   # RSS 本身不需要瀏覽器，但 2026-07-05 起改用 Playwright 解析轉址網址（見 _resolve_googlenews_url）以套用內容驗證
 }
