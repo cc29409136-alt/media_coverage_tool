@@ -103,6 +103,71 @@ def press_release_similarity(press_release_text, article_content):
     return SequenceMatcher(None, a, b).ratio()
 
 
+_SHARED_TERM_MIN_LEN = 2
+
+# 演藝新聞常見的泛用詞彙，長度剛好 2 個字時不當作「同一事件」的判斷依據（見下方
+# `press_release_shares_topic` 說明）：這些詞幾乎任何一篇該藝人的報導都可能出現，
+# 沒有辨識力，純粹是新聞稿跟文章都用了同一個常見詞彙的巧合，不代表兩篇真的在講
+# 同一件事。清單不求窮舉，實測發現遺漏就繼續擴充。
+_GENERIC_TERMS_STOPLIST = {
+    "專輯", "演出", "報導", "記者", "粉絲", "網友", "表示", "透露", "現場", "活動",
+    "公司", "經紀", "音樂", "歌手", "藝人", "消息", "內容", "工作", "社群", "發文",
+    "生活", "近況", "心情", "感動", "開心", "難過", "記得", "知道", "決定", "選擇",
+    "機會", "努力", "堅持", "夢想", "未來", "過去", "現在", "當時", "之後", "之前",
+    "後來", "最近", "最新", "全新", "正式", "官方", "宣布", "公開", "獨家", "單曲",
+    "專訪", "演唱", "巡演", "開唱", "造型", "打扮", "穿搭", "身材", "外表", "身高",
+    "體重", "年紀", "生日", "老婆", "老公", "工作室", "事務所", "笑說", "坦言",
+    "直呼", "強調", "指出", "澄清", "否認", "證實", "曝光", "爆料", "回應", "對此",
+}
+
+
+def press_release_shares_topic(press_release_text, article_content, exclude_terms=()):
+    """檢查新聞稿內容跟候選文章內容之間，除了搜尋關鍵字本身以外，還有沒有共享
+    至少一段長度 >= 2 個字的具體詞語／片語，用來判斷「這篇文章是不是在講同一個
+    事件/活動」（而不只是「同一個人」）。
+
+    2026-07-05 新增（使用者要求「窄範圍：只要同一事件/活動的報導」）。跟
+    `press_release_similarity()` 的整體相似度分數不同：那個分數容易被「同一個人
+    但完全不同話題」的雜訊拉到跟「同一事件、記者改寫用詞」差不多低的區間，沒辦法
+    用單一門檻切開兩者（實測「蕭敬騰誓詞太洗腦」——同一時期但完全不同話題的舊聞
+    重新翻紅——分數落點跟真正相關的花蓮巡演報導幾乎沒有差異）。改用
+    `SequenceMatcher.get_matching_blocks()` 找出雙方「連續相同」的具體片段（不是
+    整體比例），只要有任何一段跟關鍵字本身無關的共同片段（例如地名「花蓮」、
+    專輯名稱、活動名稱），就有很強的證據代表這是同一件事——反之，如果除了藝人
+    本名之外完全沒有任何共同片段，很可能只是剛好在相近時間點報導同一個人的
+    「另一件事」（例如舊聞翻紅、或報導這個人完全不相關的日常近況），依照使用者
+    「窄範圍」的要求應該排除。
+
+    `exclude_terms`：搜尋關鍵字本身（可能有多個別名），任何完全等於其中一個關鍵字
+    的共同片段不計入判斷依據——這只代表雙方都提到這個人的名字，本來就一定會出現，
+    沒有辨識力；真正有意義的是「除了名字以外還有沒有共同片段」。
+
+    另外也排除 `_GENERIC_TERMS_STOPLIST`（見下方）這類演藝新聞常見的泛用詞彙
+    （例如「專輯」「演出」「經紀人」）——實測發現「宋念宇」2022 年一篇完全無關的
+    舊人物專訪，剛好跟新聞稿都提到「專輯」兩個字，若不排除會被誤判成同一事件。
+    這類泛用詞彙本身沒有辨識力（幾乎任何一篇該藝人的報導都可能提到），跟「花蓮」
+    這種真正有辨識力的地名/專有名詞不同，只有長度 2 個字的共同片段才需要這層
+    泛用詞過濾（長度 >= 3 的片段已經夠具體、巧合機率低，不套用這層過濾）。
+    """
+    if not press_release_text or not article_content:
+        return False
+    a = _PR_STRIP_RE.sub('', press_release_text)
+    b = _PR_STRIP_RE.sub('', article_content)
+    if not a or not b:
+        return False
+    sm = SequenceMatcher(None, a, b)
+    for block in sm.get_matching_blocks():
+        if block.size < _SHARED_TERM_MIN_LEN:
+            continue
+        segment = a[block.a: block.a + block.size]
+        if segment in exclude_terms:
+            continue
+        if block.size == _SHARED_TERM_MIN_LEN and segment in _GENERIC_TERMS_STOPLIST:
+            continue
+        return True
+    return False
+
+
 def find_origin_match(title, original_articles, threshold=0.55):
     """在已抓到的原生媒體結果中，找出跟這篇轉載標題最相似的來源，回傳媒體名稱或 None"""
     best_score, best_site = 0, None

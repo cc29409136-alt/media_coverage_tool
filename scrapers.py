@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from config import USER_AGENT
 from matcher import (
     press_release_similarity,
+    press_release_shares_topic,
     PRESS_RELEASE_MIN_LEN,
     PRESS_RELEASE_HIGH_THRESHOLD,
 )
@@ -690,44 +691,53 @@ def _content_keyword_match(title, snippet, keywords):
     return False
 
 
-def _final_match_decision(keyword_match, press_release_text, snippet):
+def _final_match_decision(keyword_match, press_release_text, snippet, exclude_terms=()):
     """在既有的關鍵字／暱稱鄰接判斷（`keyword_match`）之上，疊加「新聞稿全文相似度」
     這個額外信號，回傳 (是否命中, 相似度分數或 None)。
 
-    2026-07-05 修正（實測發現嚴重的漏抓回歸）：舊版邏輯讓相似度分數可以「反否決」
-    已經通過 `keyword_match` 的候選（分數低於 `PRESS_RELEASE_CORROBORATE_THRESHOLD`
-    就整篇排除），原意是濾掉「掛名提及但其實是另一則新聞」的雜訊。但實測「蕭敬騰
-    花蓮開唱」真實案例：Yahoo 站台不貼新聞稿時正確找到 7 篇同一事件的報導，貼上
-    新聞稿全文後卻只剩 1 篇——因為同一事件不同媒體記者各自改寫、引用不同的談話
-    片段，`press_release_similarity()` 算出來的分數大多落在 0.05~0.15 之間（都低於
-    0.12 的佐證門檻），連明顯是同一則新聞的報導都被反否決掉。這證明「相似度不夠
-    高就反否決關鍵字命中」這個假設不成立：不同記者改寫的自然變異幅度，跟「這篇
-    其實是另一則新聞」的變異幅度沒有清楚的分數界線可以切開（先前只用單一案例
-    校準門檻，沒有涵蓋這種「同事件、多記者改寫」的常見情境）。
+    2026-07-05 第一次修正（實測發現嚴重的漏抓回歸）：舊版邏輯讓相似度分數可以
+    「反否決」已經通過 `keyword_match` 的候選，原意是濾掉「掛名提及但其實是另一則
+    新聞」的雜訊。但實測「蕭敬騰花蓮開唱」真實案例：Yahoo 站台不貼新聞稿時正確
+    找到 7 篇同一事件的報導，貼上新聞稿全文後卻只剩 1 篇——因為同一事件不同媒體
+    記者各自改寫、引用不同的談話片段，`press_release_similarity()` 整體比例分數
+    大多落在 0.05~0.15 之間，連明顯是同一則新聞的報導都被反否決掉。當時因此改成
+    相似度只能「加分」不能「扣分」。
 
-    這個工具的核心目的是「媒體露出整理」，漏掉真正的報導比多顯示一兩篇邊緣案例
-    的代價更高（使用者本來就會人工看過結果，多顯示的可以自己刪，漏掉的卻無從
-    發現）。因此改成：新聞稿相似度只能「加分」（讓關鍵字沒命中的候選也有機會
-    透過高相似度被納入，見下方 (b)），不能「扣分」否決已經通過既有嚴謹關鍵字／
-    暱稱鄰接比對（`_has_nickname_intro`／`_content_keyword_match` 的列舉雜訊防呆）
-    的候選——原本要防的「掛名提及」誤判，交給既有的關鍵字/暱稱鄰接比對本身的
-    嚴謹度把關即可，不再疊加這層相似度反否決。
+    2026-07-05 第二次修正（使用者明確要求「窄範圍：只要同一事件/活動的報導」，
+    比第一次修正的「廣範圍：這個人的所有真實報導」更嚴格）：純粹「加分不扣分」會
+    導致貼了新聞稿也濾不掉「這個人的其他真實但無關報導」——實測案例：搜尋「宋念宇
+    /小宇」時，Google 新聞撈到一篇 2022 年的舊人物專訪（跟這次新聞稿描述的活動
+    完全無關，只是剛好也提到這個人、剛好也真的存在），因為 `keyword_match` 為
+    True 就直接收錄，不會被新聞稿排除掉。
+
+    這裡改用 `press_release_shares_topic()`（見 matcher.py，用
+    `SequenceMatcher.get_matching_blocks()` 找雙方有沒有共享「除了關鍵字本身以外」
+    的具體片段，例如地名/專輯名/活動名稱）取代單純的整體相似度分數：整體比例分數
+    在「同事件多記者改寫」（分數偏低）跟「同人物不同話題」（分數也偏低）這兩種
+    情境之間沒有清楚的界線，沒辦法用單一門檻切開（見第一次修正的教訓）；但「有沒有
+    共享具體片段」是更精準的訊號——同一事件不管記者怎麼改寫，通常還是會保留一些
+    具體名詞（地名、活動名稱等），但完全不同話題的報導幾乎不會剛好共享這些具體
+    名詞。`exclude_terms`（通常是使用者輸入的關鍵字／別名）用來排除「雙方都提到
+    這個人名字」這種沒有辨識力的片段，只看名字以外的共同片段。
 
     判斷邏輯（`press_release_text` 有效時）：
-    - (a) 關鍵字比對已命中：一律命中，相似度分數僅供參考（顯示用），不影響是否收錄。
-    - (b) 關鍵字比對沒命中，但相似度 >= 高信心門檻（文章改寫幅度大、暱稱鄰接
-      句型比對不到，但內容明顯跟新聞稿是同一則事件）：一樣視為命中。
-    - 其餘情況（關鍵字沒命中、相似度也不夠高）：不命中。
+    - (a) 關鍵字比對已命中 AND 除了關鍵字本身還有其他共享的具體片段：命中。
+    - (b) 整體相似度 >= 高信心門檻（文章改寫幅度大、找不到單一具體共享片段，
+      但整體內容明顯高度重疊，通常代表逐句改寫同一篇新聞稿）：一樣視為命中。
+    - 其餘情況（含「關鍵字比對命中但沒有任何具體共享片段」——這正是本次要濾掉的
+      「同一個人、不同事件」案例）：不命中。
 
     `press_release_text` 為空/太短（見 `PRESS_RELEASE_MIN_LEN`）或沒有 snippet 可比對時，
     完全不套用新聞稿相似度，原樣回傳既有的 `keyword_match` 布林值——維持沒有貼新聞稿
-    情境下的既有行為不變。
+    情境下的既有行為不變（沒有新聞稿就沒有「同一事件」可以比對，只能回到「這個人的
+    所有真實報導」這個較寬的預設）。
     """
     if not press_release_text or len(press_release_text.strip()) < PRESS_RELEASE_MIN_LEN or not snippet:
         return keyword_match, None
 
     score = press_release_similarity(press_release_text, snippet)
-    if keyword_match:
+    shares_topic = press_release_shares_topic(press_release_text, snippet, exclude_terms=exclude_terms)
+    if keyword_match and shares_topic:
         return True, score
     if score >= PRESS_RELEASE_HIGH_THRESHOLD:
         return True, score
@@ -783,7 +793,9 @@ def _verify_candidates(candidates, keyword, start_date, end_date,
                 if snippet is not None:
                     # 成功造訪文章本頁：用內容摘要做最終判斷（可能疊加新聞稿相似度）
                     keyword_match = _content_keyword_match(c["title"], snippet, keywords)
-                    matched, pr_score = _final_match_decision(keyword_match, press_release_text, snippet)
+                    matched, pr_score = _final_match_decision(
+                        keyword_match, press_release_text, snippet, exclude_terms=keywords
+                    )
                     if not matched:
                         continue
                 else:
@@ -2087,7 +2099,9 @@ def search_googlenews(page, keyword, start_date, end_date, press_release_text=No
             continue
         d, snippet = _fetch_article_content_and_date(real_url)
         keyword_match = _content_keyword_match(c["title"], snippet, [keyword])
-        matched, pr_score = _final_match_decision(keyword_match, press_release_text, snippet)
+        matched, pr_score = _final_match_decision(
+            keyword_match, press_release_text, snippet, exclude_terms=[keyword]
+        )
         if not matched:
             continue
         if d is not None and not (start_date <= d <= end_date):
