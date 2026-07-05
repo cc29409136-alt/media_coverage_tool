@@ -3,7 +3,7 @@ import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urljoin
 
@@ -241,10 +241,17 @@ _ARTICLE_DATE_TIMEOUT = 8  # 單篇文章頁請求逾時秒數（`_verify_candid
 
 _ISO_DATE_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
 _SLASH_DATE_RE = re.compile(r'(\d{4})/(\d{2})/(\d{2})')
+# 2026-07-05 新增：FTNN新聞網（見 search_ftnn）搜尋結果列表頁的 `<span class="s-news-time">`
+# 用點號分隔（例如 "2026.03.18 15:41"），既有的 ISO／斜線格式都比對不到，導致 `_parse_date_string`
+# 回傳 None，讓 search_ftnn 的「驗證前預先過濾」形同虛設（範圍外的候選因為解析失敗而沒被排除）。
+# 這是共用的日期解析工具，不只 ftnn 會用到（`_extract_date_from_soup` 的 regex 保底路徑等也共用
+# 這個函式），加這個格式不影響既有的 ISO／斜線格式判斷順序，純粹新增一種能辨識的日期字串格式。
+_DOT_DATE_RE = re.compile(r'(\d{4})\.(\d{2})\.(\d{2})')
 
 
 def _parse_date_string(s):
-    """把常見的日期字串（ISO 8601、YYYY-MM-DD、YYYY/MM/DD 等）轉成 date 物件，失敗回傳 None。"""
+    """把常見的日期字串（ISO 8601、YYYY-MM-DD、YYYY/MM/DD、YYYY.MM.DD 等）轉成 date 物件，
+    失敗回傳 None。"""
     if not s:
         return None
     s = s.strip()
@@ -264,6 +271,12 @@ def _parse_date_string(s):
         except ValueError:
             return None
     m = _SLASH_DATE_RE.search(s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = _DOT_DATE_RE.search(s)
     if m:
         try:
             return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -338,6 +351,44 @@ def _extract_date_from_soup(soup, raw_text):
         d = _parse_date_string(time_tag.get_text())
         if d:
             return d
+
+    # 4b. Blogger 平台預設模板的發布時間標籤：<abbr class="published" title="...">
+    # （見 search_ponews／博新聞網實測案例：這個站台完全沒有 meta / JSON-LD / <time>
+    # 標籤，og:description 也是空字串，唯一找得到的日期線索就是這個 Blogger 樣板固定
+    # 會輸出的 `<abbr class="published">`）。`title` 屬性通常是完整 ISO 8601
+    # （例如 "2026-07-01T19:36:00+08:00"），直接交給 `_parse_date_string()` 即可；
+    # 如果 `title` 屬性不存在或解析失敗，才退回標籤內文文字，格式是「M/DD/YYYY」
+    # （月份不補零、年份在最後），既有的 `_SLASH_DATE_RE` 是「YYYY/MM/DD」年份在前的
+    # 格式比對不到，這裡改用 month-first regex 另外解析，不動 `_parse_date_string()`
+    # 既有的通用邏輯。
+    abbr_tag = soup.find("abbr", attrs={"class": re.compile(r'\bpublished\b')})
+    if abbr_tag:
+        d = _parse_date_string(abbr_tag.get("title"))
+        if d:
+            return d
+        m = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', abbr_tag.get_text())
+        if m:
+            try:
+                return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+            except ValueError:
+                pass
+
+    # 4c. 花蓮新聞快報 hualien-today.com（見 search_hualientoday）這類自架 CMS 常見的
+    # 「日曆圖示 + <span>日期</span>」版型：沒有 meta／JSON-LD／<time> 標籤，發布日期
+    # 純粹是 `<img src="...icondateblack...">` 後面緊接一個純文字 `<span>YYYY-MM-DD</span>`。
+    # 這個日期文字本身格式跟 `_ISO_DATE_RE` 相容，問題出在它常常出現在頁面很後段
+    # （實測某篇文章日期文字在原始 HTML 第 18541 字元處），超過下面步驟 5「只看前
+    # 5000 字」的取樣範圍，導致這類頁面明明有清楚的日期卻抓不到。這裡改成明確找
+    # 這個 icon+span 的 DOM 結構（不受文字位置影響），取第一個出現的（同一頁通常
+    # 還有「相關文章」列表也用同樣版型附帶日期，但第一個必定是本篇文章自己的日期，
+    # 在任何相關文章列表之前）。
+    date_icon = soup.find("img", src=re.compile(r'icondate', re.IGNORECASE))
+    if date_icon:
+        sib = date_icon.find_next_sibling("span")
+        if sib:
+            d = _parse_date_string(sib.get_text(strip=True))
+            if d:
+                return d
 
     # 5. 最後手段：在頁面前段文字中用 regex 找 YYYY-MM-DD / YYYY/MM/DD
     text_sample = raw_text[:5000]
@@ -646,12 +697,35 @@ def search_appledaily(page, keyword, start_date, end_date, press_release_text=No
 
 def search_tvbs(page, keyword, start_date, end_date, press_release_text=None):
     """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
-    日期改交給 `_verify_candidates()` 內建的文章頁日期擷取 cascade，比舊版從列表頁
-    「3小時前」這類相對時間字串換算更精確（相對時間換算本來就有±1天的誤差風險）。"""
+
+    2026-07-05 修正（實測發現的 overflow bug，跟 setn／taisounds 同一類）：搜尋結果頁
+    本身確實嚴格新到舊排序（每頁 25 筆），但 `_all_links_requests()` 用全頁 `<a>` 掃描
+    時，會把頁面右側「熱門文章」（`from=Popular_txt_click` query string）等跟搜尋關鍵字
+    無關的推薦連結也一起掃進來，導致候選數從 25 筆膨脹到 40 筆，把真正的搜尋結果擠過
+    `_CONTENT_VERIFY_MAX_CANDIDATES=20` 的驗證額度，尾端幾篇（含數個月前的舊聞，例如
+    2026/03/22 的報導）落入 overflow 桶、date 標記為 None 但仍被顯示。
+
+    修法：實測發現每篇真正的搜尋結果 `<a>` 標籤本身就帶有 `data-publish_date="YYYY/MM/DD
+    HH:MM"` 屬性（"熱門文章" 側欄連結沒有這個屬性，可以用它天然排除雜訊），且這個日期
+    已驗證跟文章本頁一致。改成直接找出所有帶 `data-publish_date` 的 `<a>`，用這個日期
+    做「驗證前預先過濾」，範圍外的候選不會進入 `links` list，同時也順便濾掉了汙染候選
+    數的側欄雜訊連結（沒有這個屬性的側欄連結完全不會被加入）。
+    """
     kw = quote(keyword)
     url = f"https://news.tvbs.com.tw/news/searchresult/{kw}/news"
     soup = _get_soup(url)
-    links = _all_links_requests(soup, url)
+    links = []
+    if soup is not None:
+        for a in soup.find_all("a", href=True, attrs={"data-publish_date": True}):
+            title = _extract_link_title(a)
+            if not title:
+                continue
+            pub_d = _parse_date_string(a["data-publish_date"])
+            if pub_d is not None and not (start_date <= pub_d <= end_date):
+                continue  # 列表頁自帶可信日期，範圍外提早排除，不佔驗證額度（同 search_setn）
+            href = urljoin(url, a["href"])
+            context = _extract_link_context(a, title)
+            links.append({"title": title, "href": href, "context": context})
     candidates = _candidate_filter(links, ["tvbs.com.tw/entertainment/", "tvbs.com.tw/life/", "tvbs.com.tw/local/"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
@@ -718,12 +792,84 @@ def search_mirror(page, keyword, start_date, end_date, press_release_text=None):
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
 
+_YAHOO_RELATIVE_TIME_RE = re.compile(r'([0-9０-９]+)\s*(分鐘前|小時前|天前|週前|個月前|年前)')
+_FULLWIDTH_DIGIT_TABLE = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _parse_yahoo_relative_time(text):
+    """把 Yahoo奇摩新聞搜尋結果卡片（`li.stream-card` 最下方的「來源 ・ N天前」文字）
+    換算成粗略的 date 物件，抓不到就回傳 None。
+
+    這是「相對時間」，天生比絕對日期（ISO／meta tag）不精確（±1 天可能因為時區／
+    「今天」邊界問題而有誤差，這點跟本檔案其他地方提到相對時間換算的風險一致），
+    所以只拿來做「驗證前預先過濾」的粗篩，不會拿來當作候選最終顯示的 `date` 欄位
+    （最終顯示的日期仍然交給 `_verify_candidates()` 造訪文章本頁的日期擷取 cascade，
+    這裡的相對時間只用來決定「要不要讓這個候選進入驗證清單」）。"""
+    m = _YAHOO_RELATIVE_TIME_RE.search(text)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1).translate(_FULLWIDTH_DIGIT_TABLE))
+    except ValueError:
+        return None
+    unit = m.group(2)
+    if unit == "分鐘前" or unit == "小時前":
+        days = 0
+    elif unit == "天前":
+        days = n
+    elif unit == "週前":
+        days = n * 7
+    elif unit == "個月前":
+        days = n * 30
+    elif unit == "年前":
+        days = n * 365
+    else:
+        return None
+    return TODAY - timedelta(days=days)
+
+
 def search_yahoo(page, keyword, start_date, end_date, press_release_text=None):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+
+    2026-07-05 修正（實測發現的 overflow bug，跟 tvbs／ftnn 同一類「候選數被非搜尋結果
+    的雜訊連結撐爆」）：`_all_links_requests()` 用全頁 `<a>` 掃描時，除了 20 篇真正的
+    搜尋結果（每篇包在 `<li class="stream-card">` 裡）以外，還會把頁尾／側欄大量
+    `topic/`、分類頁、其他導覽連結一起掃進來（實測「蕭敬騰」關鍵字候選數從 20 筆
+    撐到 71 筆），這些雜訊連結的標題／URL 明顯跟搜尋關鍵字無關，理論上不會通過
+    `_candidate_filter()` 的關鍵字比對——但因為 `_candidate_filter()` 本來就不做關鍵字
+    比對（見該函式 docstring，關鍵字判斷延後到 `_verify_candidates()`），這些雜訊
+    還是會先佔用候選名額，把真正的搜尋結果擠向候選清單後段甚至擠出 20 篇驗證額度，
+    等於間接造成跟其他站台一樣的 overflow 風險（已實測：不修的話最前面 20 個
+    「進入驗證」的候選其實還是 20 篇真正的搜尋結果沒錯，但因為雜訊佔用，某些關鍵字
+    下真正的搜尋結果會被擠出 20 篇之外，變成 overflow 桶的 date=None）。
+
+    修法：只掃描 `li.stream-card` 這個真正的搜尋結果卡片容器（雜訊連結不在這個
+    容器裡，天然被排除），同時這個容器最下方帶有「來源 ・ N天前」的相對時間文字
+    （見 `_parse_yahoo_relative_time()`），拿來做「驗證前預先過濾」，範圍外的候選
+    不會進入 `links` list，不佔用驗證額度。相對時間本身有 ±1 天的誤差風險，所以
+    這裡沿用其他相對時間換算場景的保守做法：只在「明確算出的日期」確定不在範圍內
+    才排除，不是用來當作候選最終顯示的日期（顯示日期仍由 `_verify_candidates()`
+    造訪文章本頁取得，準確度不受相對時間誤差影響）。"""
     kw = quote(keyword)
     url = f"https://tw.news.yahoo.com/search?p={kw}"
     soup = _get_soup(url)
-    links = _all_links_requests(soup, url)
+    links = []
+    if soup is not None:
+        for card in soup.find_all("li", class_="stream-card"):
+            a = card.find("h3")
+            a = a.find("a", href=True) if a else None
+            if not a:
+                continue
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            time_div = card.find_all("div")[-1] if card.find_all("div") else None
+            pub_d = _parse_yahoo_relative_time(time_div.get_text(strip=True)) if time_div else None
+            if pub_d is not None and not (start_date <= pub_d <= end_date):
+                continue  # 相對時間換算的粗略日期，範圍外提早排除，不佔驗證額度
+            summary_el = card.find("p")
+            context = summary_el.get_text(strip=True) if summary_el else title
+            links.append({"title": title, "href": a["href"], "context": context})
     candidates = _candidate_filter(links, ["tw.news.yahoo.com/"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
@@ -785,12 +931,94 @@ def search_mnews(page, keyword, start_date, end_date, press_release_text=None):
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
 
+def _extract_ctinews_nuxt_items(soup):
+    """從中天新聞網搜尋結果頁的 `<script id="__NUXT_DATA__" type="application/json">`
+    擷取每篇候選文章的 `news_id`／標題／發布時間。
+
+    背景（2026-07-05 實測發現的 overflow bug，跟 setn／taisounds／tvbs 同一類）：
+    這個頁面是 Nuxt SSR，搜尋結果列表頁的 DOM 本身完全沒有任何日期文字（每張卡片只有
+    標題＋標籤，見 `.search-card--default`），但搜尋結果常常一次回傳 25 篇候選（超過
+    `_CONTENT_VERIFY_MAX_CANDIDATES=20`），且排序是「跟關鍵字的相關度」而非嚴格新到舊
+    （實測「蕭敬騰」關鍵字 25 筆候選全部落在 2025-10 ~ 2026-06，即使測試窗口設在
+    2026-07 也是一樣這 25 筆，沒有任何一筆真正落在窗口內——原本的寫法會讓最後 5 筆
+    落入 overflow 桶、以 date=None 不篩日期全部顯示，等於把半年前的舊聞當作命中結果）。
+
+    真正的日期線索藏在 Nuxt 3 的 `__NUXT_DATA__` payload 裡：這是 devalue 序列化格式
+    （一個扁平化的 JSON array，物件用「欄位名 → 陣列索引」的 dict 表示，實際值要
+    再去對應索引取一次，例如 `{"news_id": 249, "publish_dt": 254, ...}` 表示這個物件的
+    `news_id` 欄位值放在 `data[249]`）。這裡不去完整實作 devalue 反序列化（沒有必要，
+    只需要抓日期），改用「掃描整個扁平陣列，找出形狀像搜尋結果項目的 dict（同時具備
+    `news_id`／`title`／`publish_dt` 三個 key）」的方式，對每個符合的 schema dict 用
+    它自己記錄的索引去 `data[]` 取出真正的 `news_id`／`title`／`publish_dt` 字串——
+    這個做法比硬編索引位置更穩健（Nuxt 每次建置索引位置都會變動，但欄位名稱與整體
+    形狀不會變），已實測跟直接手動追蹤陣列位置得到的結果完全一致。
+
+    `link`／`url` 欄位在 payload 裡是空字串（Nuxt 這裡沒有把文章網址序列化進去），
+    所以呼叫端仍需照舊用 `news_id` 拼出 `ctinews.com/news/items/<news_id>` 網址
+    （這個 URL pattern本來就是既有程式碼在用的，這裡沒有改變）。
+
+    回傳 list of (news_id, title, publish_dt_iso_string)，publish_dt 可能是 None
+    （欄位存在但值是 null）；解析失敗或找不到 `__NUXT_DATA__` script 回傳空 list，
+    呼叫端應視為「沒有可信日期線索」、整批候選照舊流程处理（不影響既有行為）。
+    """
+    script = soup.find("script", id="__NUXT_DATA__")
+    if not script or not script.string:
+        return []
+    try:
+        data = json.loads(script.string)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+
+    seen = set()
+    results = []
+    for v in data:
+        if not (isinstance(v, dict) and "news_id" in v and "publish_dt" in v and "title" in v):
+            continue
+        try:
+            news_id = data[v["news_id"]]
+            title = data[v["title"]]
+            publish_dt = data[v["publish_dt"]]
+        except (IndexError, TypeError):
+            continue
+        if not isinstance(news_id, str) or not isinstance(title, str) or news_id in seen:
+            continue
+        seen.add(news_id)
+        results.append((news_id, title, publish_dt if isinstance(publish_dt, str) else None))
+    return results
+
+
 def search_ctinews(page, keyword, start_date, end_date, press_release_text=None):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+
+    2026-07-05 修正：搜尋結果列表頁本身沒有任何可見日期文字，且排序非嚴格新到舊，
+    候選數常超過 20 篇驗證額度上限，導致 overflow 桶的候選（date=None）把數月前的
+    舊聞當作命中結果顯示（詳見 `_extract_ctinews_nuxt_items()` docstring）。改用該
+    函式從 Nuxt SSR payload（`__NUXT_DATA__`）擷取每篇候選的可信發布時間，在丟進
+    `_candidate_filter()`／`_verify_candidates()` 之前先排除範圍外的候選，不佔用
+    overflow 桶（同 `search_setn()`／`search_tvbs()` 的做法）。如果解析不到
+    `__NUXT_DATA__`（例如網站改版），退回原本「不篩日期」的行為，不會比修改前更差。
+    """
     kw = quote(keyword)
     url = f"https://ctinews.com/search/{kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
+    nuxt_items = _extract_ctinews_nuxt_items(soup) if soup is not None else []
+    if nuxt_items:
+        date_by_news_id = {}
+        for news_id, _title, publish_dt in nuxt_items:
+            d = _parse_date_string(publish_dt) if publish_dt else None
+            date_by_news_id[news_id] = d
+        filtered_links = []
+        for it in links:
+            m = re.search(r'/news/items/([^/?#]+)', it["href"])
+            news_id = m.group(1) if m else None
+            pub_d = date_by_news_id.get(news_id) if news_id else None
+            if pub_d is not None and not (start_date <= pub_d <= end_date):
+                continue  # Nuxt payload 給了可信日期，範圍外提早排除，不佔驗證額度
+            filtered_links.append(it)
+        links = filtered_links
     candidates = _candidate_filter(links, ["ctinews.com/news/items/"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
@@ -824,12 +1052,38 @@ def search_owlnews(page, keyword, start_date, end_date, press_release_text=None)
 
 def search_ftnn(page, keyword, start_date, end_date, press_release_text=None):
     """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
-    日期改交給 `_verify_candidates()` 內建的文章頁日期擷取 cascade，取代舊版從標題文字
-    regex 挖 YYYY.MM.DD 的做法。"""
+
+    2026-07-05 修正（實測發現的 overflow bug，跟 setn／tvbs／ctinews 同一類）：這個搜尋
+    結果頁本身的真正搜尋結果只有 24 篇（每篇包在 `<div class="search-news">` 裡），但
+    `_all_links_requests()` 用全頁 `<a>` 掃描時，會把頁面下半段「熱門新聞／即時新聞」
+    等跟搜尋關鍵字完全無關的推薦清單（財經、其他藝人新聞）也一起掃進來，把候選數從
+    24 筆撐到 44 筆，超過 `_CONTENT_VERIFY_MAX_CANDIDATES=20`，導致真正搜尋結果的尾端
+    幾篇（例如 2026.03.18 的舊聞）落入 overflow 桶、以 date=None 跳過日期檢查顯示。
+
+    修法：每個真正的搜尋結果 `<div class="search-news">` 內都帶有標題
+    （`<p class="search-tit">`）與可信發布時間（`<span class="s-news-time">`，格式
+    `YYYY.MM.DD HH:MM`）——這兩個 class name 只出現在真正的搜尋結果卡片，天然排除了
+    後段的推薦清單雜訊。改成只掃描 `div.search-news` 容器，用 `s-news-time` 做「驗證前
+    預先過濾」，範圍外的候選不會進入 `links` list，也不會佔用驗證額度。"""
     kw = quote(keyword)
     url = f"https://www.ftnn.com.tw/search?keyword={kw}&all=true"
     soup = _get_soup(url, timeout=35)
-    links = _all_links_requests(soup, url)
+    links = []
+    if soup is not None:
+        for card in soup.find_all("div", class_="search-news"):
+            a = card.find_parent("a", href=True)
+            title_el = card.find("p", class_="search-tit")
+            if not a or not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            if not title:
+                continue
+            time_el = card.find("span", class_="s-news-time")
+            pub_d = _parse_date_string(time_el.get_text(strip=True)) if time_el else None
+            if pub_d is not None and not (start_date <= pub_d <= end_date):
+                continue  # 列表頁自帶可信日期，範圍外提早排除，不佔驗證額度（同 search_setn）
+            href = urljoin(url, a["href"])
+            links.append({"title": title, "href": href, "context": title})
     candidates = _candidate_filter(links, ["ftnn.com.tw/news/"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
@@ -905,14 +1159,49 @@ def search_ponews(page, keyword, start_date, end_date, press_release_text=None):
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
 
+_HUALIENTODAY_MAX_CANDIDATES = 80  # 見 search_hualientoday()：這個站台的搜尋結果頁沒有任何
+# 列表頁層級的可信日期線索，改用「調高驗證額度」這個次佳解法（詳見函式 docstring）。
+
+
 def search_hualientoday(page, keyword, start_date, end_date, press_release_text=None):
-    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。"""
+    """已改用 requests + BeautifulSoup（伺服器端渲染）。page 參數保留但不使用。
+
+    2026-07-05 實測發現的 bug（跟其他站台的 overflow 問題略有不同，是這裡特有的
+    「context 汙染」變形）：這個 WordPress 站台的 `?s=` 搜尋等於沒有真正依關鍵字
+    過濾（實測「蕭敬騰」關鍵字搜尋結果 66 筆候選裡，只有 1 篇真正提到這個人，
+    其餘都是花蓮在地新聞——跟 juksy／po-news 一樣的「搜尋形同虛設」問題，這裡
+    不特別處理，只影響有多少候選會被丟進驗證，不影響日期過濾本身）。
+
+    真正影響日期正確性的是：搜尋結果列表頁的 DOM 版型把「每 6 篇一組」的卡片包在
+    同一個 `<aside>` 容器裡（沒有各自獨立的外層），導致 `_extract_link_context()`
+    往上找父層容器時，會把同一組 6 篇文章的標題全部串在一起當作 context（每篇
+    候選的 `context` 內容幾乎一樣，都包含整組 6 篇標題）。這造成 overflow 桶的
+    `_has_nickname_intro(context, keyword)` 比對失真：只要組內剛好有 1 篇真的
+    提到關鍵字，同一組其餘 5 篇不相關的候選也會一起被誤判為命中（實測「蕭敬騰」
+    只出現在 1 篇裡，但同組另外 5 篇花蓮在地新聞——鼓王爭霸戰、購物節、豐年節等
+    —— 全部因為這個 context 汙染被一起顯示，且因為 overflow 桶不驗證日期，
+    全部以 date=None 顯示，看起來像是同一批「蕭敬騰」相關的命中結果）。
+
+    列表頁本身完全沒有任何日期文字／屬性可用（實測過縮圖網址、`<time>`、data
+    屬性都沒有），沒有可信的日期線索可以做「驗證前預先過濾」，所以這裡改用
+    次佳解法：調高 `_verify_candidates(max_candidates=...)`，讓更多候選（含
+    這種因 context 汙染而被拉近但實際跟關鍵字無關的候選）都能造訪文章本頁做
+    真正的內容驗證，而不是退回不可靠的 context 比對——已實測確認調高後：
+    (1) 真正相關的候選（夏戀嘉年華蕭敬騰報導）能正確標上文章本頁日期
+    (2) 因 context 汙染而混進來的 5 篇不相關花蓮新聞，各自造訪本頁驗證後
+        內容不含關鍵字，正確被排除，不再誤判命中。
+    這個修法同時解決「日期」與「context 汙染誤判」兩個問題，因為問題根源相同
+    （overflow 桶不驗證內容、只信任不可靠的列表頁 context）。
+    """
     kw = quote(keyword)
     url = f"https://hualien-today.com/?s={kw}"
     soup = _get_soup(url, timeout=30)
     links = _all_links_requests(soup, url)
     candidates = _candidate_filter(links, ["hualien-today.com/news.php?listno="])
-    return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
+    return _verify_candidates(
+        candidates, keyword, start_date, end_date,
+        max_candidates=_HUALIENTODAY_MAX_CANDIDATES, press_release_text=press_release_text,
+    )
 
 
 def search_insightpost(page, keyword, start_date, end_date, press_release_text=None):
@@ -1039,18 +1328,44 @@ def search_taisounds(page, keyword, start_date, end_date, press_release_text=Non
     `date=None`（不是抓不到日期，文章頁日期其實抓得到，見
     `_fetch_article_content_and_date` 的獨立測試；純粹是候選順序問題）。
 
-    修法：拿到候選列表後，先依「標題是否包含關鍵字」重新排序（標題命中的排到
-    前面），再交給 `_candidate_filter()`／`_verify_candidates()`。這不算繞過
-    「造訪文章本頁驗證內容」的原則——每篇候選還是一樣會被 `_verify_candidates()`
-    造訪本頁驗證，這裡只是調整「哪 20 篇優先拿到驗證名額」的順序，跟
-    `search_cts()`／`search_videoland()` 用 API 日期做預先過濾是同樣的精神
-    （避免明顯不相關或排序考量的候選白白占用驗證額度），只是這裡沒有 API
-    日期可用，改用「標題關鍵字」這個更陽春但一樣可靠的訊號。
+    2026-07-05 修正（實測發現上面這版「標題重排序」不夠：這個頁面第一頁根本
+    可能整頁都是跟關鍵字完全無關的全站最新新聞，標題排序只是把「本來就沒有」
+    的東西挪到前面，並不能保證真正相關的候選會落在 20 篇驗證額度內——實測
+    「小宇」關鍵字的第一頁 10 篇 `<li>` 全部是總統教育獎／世足賽這類完全無關的
+    頭條，標題排序後順序不變，真正命中「小宇攜手艾薇闖《紅白》」這類舊聞只能
+    透過 overflow 桶的列表頁摘要比對，一樣繞過日期檢查，出現 2024 年舊聞當作
+    命中結果的問題，跟已經修過的 setn 是同一類 bug）。
+
+    真正的修法：每個 `<li>` 本身就帶有可信的發布時間——`<p class="media-date">`
+    （格式 `YYYY-MM-DD HH:MM`，已實測跟文章本頁一致），不需要像 setn 那樣拐個彎
+    從縮圖網址猜日期。改成直接解析 `ul#ulnewslist` 底下每個 `<li>`，取得
+    標題（`<h4>`）、連結、日期（`<p class="media-date">`）、摘要
+    （`<p class="text-truncate-2">` 的 `title` 屬性），範圍外的候選比照
+    `search_cts()`／`search_setn()` 提早排除、不進 `_candidate_filter()`／
+    `_verify_candidates()`，避免無關的全站最新新聞占用驗證額度，也避免真正
+    命中但範圍外的舊聞透過 overflow 桶跳過日期檢查。
     """
     kw = quote(keyword)
     url = f"https://www.taisounds.com/lookfor/tag/{kw}"
     soup = _get_soup(url)
-    links = _all_links_requests(soup, url)
+    links = []
+    if soup is not None:
+        ul = soup.find("ul", id="ulnewslist")
+        for li in (ul.find_all("li", recursive=False) if ul else []):
+            a = li.find("a", href=True)
+            if not a:
+                continue
+            title_el = a.find(["h1", "h2", "h3", "h4"])
+            title = title_el.get_text(strip=True) if title_el else a.get_text(strip=True)
+            if not title:
+                continue
+            date_el = a.find("p", class_="media-date")
+            pub_d = _parse_date_string(date_el.get_text(strip=True)) if date_el else None
+            if pub_d is not None and not (start_date <= pub_d <= end_date):
+                continue  # 列表頁自帶可信日期，範圍外提早排除，不佔驗證額度（同 search_cts／search_setn）
+            summary_el = a.find("p", class_="text-truncate-2")
+            context = (summary_el.get("title") or summary_el.get_text(strip=True)) if summary_el else title
+            links.append({"title": title, "href": urljoin(url, a["href"]), "context": context})
     candidates = _candidate_filter(links, ["taisounds.com/news/content/"])
     candidates.sort(key=lambda c: 0 if keyword in c["title"] else 1)
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
@@ -1117,12 +1432,36 @@ def search_yam(page, keyword, start_date, end_date, press_release_text=None):
     不需要瀏覽器執行 JS。`search.yam.com` 這個結果頁本身也是伺服器端渲染，直接用
     `requests` 拿到的 HTML 就含有完整搜尋結果（已實測「蕭敬騰」關鍵字在 HTML
     中出現數十次，不是只在 meta 標籤）。
+
+    2026-07-05 修正（實測發現的 overflow bug，跟 setn／tvbs／ctinews 同一類）：搜尋結果
+    常一次回傳 30 篇候選（超過 `_CONTENT_VERIFY_MAX_CANDIDATES=20`），且排序不是嚴格
+    新到舊（實測「蕭敬騰」關鍵字 30 筆候選裡日期從 2025-02 跳到 2026-07 又跳回
+    2025-09，混雜排列），導致真正在查詢範圍內的候選被擠到 overflow 桶、以 date=None
+    跳過日期檢查，把數個月甚至一年前的舊聞當作命中結果顯示。
+
+    修法：這個站台的文章網址本身就內嵌可信的發布日期——`https://n.yam.com/Article/
+    <YYYYMMDD><流水號>`（已實測跟文章本頁擷取到的日期完全一致，例如
+    `/Article/20260701705628` 對應 2026-07-01），不需要額外請求就能從候選列表階段
+    的 URL 直接解析出日期，比照 `search_pchome()` 用 URL 路徑日期做「驗證前預先
+    過濾」的做法，範圍外的候選不會進入 `links` list，不佔用驗證額度。
     """
     kw = quote(keyword)
     url = f"https://n.yam.com/Home/keywordSearch?keyword={kw}"
     soup = _get_soup(url)
     links = _all_links_requests(soup, url)
-    candidates = _candidate_filter(links, ["n.yam.com/Article/"])
+    filtered_links = []
+    for it in links:
+        m = re.search(r'/Article/(\d{4})(\d{2})(\d{2})\d+', it["href"])
+        pub_d = None
+        if m:
+            try:
+                pub_d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                pub_d = None
+        if pub_d is not None and not (start_date <= pub_d <= end_date):
+            continue  # 網址本身內嵌可信日期，範圍外提早排除，不佔驗證額度（同 search_pchome）
+        filtered_links.append(it)
+    candidates = _candidate_filter(filtered_links, ["n.yam.com/Article/"])
     return _verify_candidates(candidates, keyword, start_date, end_date, press_release_text=press_release_text)
 
 
