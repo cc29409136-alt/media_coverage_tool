@@ -79,6 +79,7 @@ st.title("📰 媒體露出整理小工具")
 st.caption(
     "設定日期區間 ＋ 關鍵字，自動搜尋各大媒體與轉載平台，整理成可直接複製、下載的露出清單。"
 )
+st.caption("🔧 build-check: 2026-07-05-narrow-scope-v1（如果你沒看到這行，代表 Reboot 沒有真的套用最新程式碼）")
 
 active_original_count = len([s for s in ACTIVE_SITES if s["category"] == "原生媒體"])
 active_syndication_count = len([s for s in ACTIVE_SITES if s["category"] == "轉載平台"])
